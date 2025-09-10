@@ -2,9 +2,10 @@
  * esp32 NMEA 2k to rs485 gateway
  * 
  * Author: caseyn
- * Date: 2025-08-01
+ * Date: 2025-09-11
  * 
  * added OTA updates
+ * added log message output to webserver
  */
 
 #include <ESP32-TWAI-CAN.hpp>
@@ -54,6 +55,27 @@ bool debugRS485 = false;    // Set true for verbose RS485 debug
 
 #define DEBUG_PRINT_NMEA2000(...) do { if (debugNMEA2000) Serial.printf(__VA_ARGS__); } while (0)
 #define DEBUG_PRINT_RS485(...) do { if (debugRS485) Serial.printf(__VA_ARGS__); } while (0)
+
+#define LOG_BUFFER_SIZE 4096
+char logBuffer[LOG_BUFFER_SIZE];
+size_t logHead = 0;
+
+void logMessage(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    char temp[128];
+    int len = vsnprintf(temp, sizeof(temp), fmt, args);
+    va_end(args);
+
+    // Write to Serial
+    Serial.write((uint8_t*)temp, len);
+
+    // Write to circular buffer
+    for (int i = 0; i < len; i++) {
+        logBuffer[logHead] = temp[i];
+        logHead = (logHead + 1) % LOG_BUFFER_SIZE;
+    }
+}
 
 // --- Depth data storage --- rs485
 uint16_t depth_tenths = 0; // Depth in tenths of a foot (e.g., 123 = 12.3 ft)
@@ -612,6 +634,120 @@ const char* custom_404_html = R"rawliteral(
 </html>
 )rawliteral";
 
+const char* logs_viewer_html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32 Logs Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {
+      background: #181a1b;
+      color: #f1f1f1;
+      font-family: monospace, Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+    }
+    h2 { color: #90caf9; margin-top: 2rem; }
+    #logbox {
+      background: #23272a;
+      width: 90vw;
+      max-width: 900px;
+      min-height: 60vh;
+      margin-top: 1rem;
+      border-radius: 10px;
+      box-shadow: 0 2px 16px #000a;
+      padding: 1em;
+      overflow-x: auto;
+      overflow-y: auto;
+      font-size: 1em;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .controls {
+      display: flex;
+      gap: 0.5em;
+      margin: 1em 0;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    button {
+      background: #1976d2;
+      color: #f1f1f1;
+      border: none;
+      border-radius: 6px;
+      padding: 0.5em 1.5em;
+      font-size: 1em;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover {
+      background: #1565c0;
+    }
+  </style>
+</head>
+<body>
+  <h2>ESP32 Logs Viewer</h2>
+  <div class="controls">
+    <button onclick="clearLog()">Clear Display</button>
+    <button onclick="toggleDebug('nmea', true)">Enable NMEA2000 Debug</button>
+    <button onclick="toggleDebug('nmea', false)">Disable NMEA2000 Debug</button>
+    <button onclick="toggleDebug('rs485', true)">Enable RS485 Debug</button>
+    <button onclick="toggleDebug('rs485', false)">Disable RS485 Debug</button>
+  </div>
+  <div id="logbox">Loading logs...</div>
+  <script>
+    const logbox = document.getElementById('logbox');
+    let lastLog = '';
+
+    function fetchLogs() {
+      fetch('/logs')
+        .then(response => response.text())
+        .then(data => {
+          if (data !== lastLog) {
+            logbox.textContent = data;
+            logbox.scrollTop = logbox.scrollHeight;
+            lastLog = data;
+          }
+        })
+        .catch(err => {
+          logbox.textContent = 'Error loading logs: ' + err;
+        });
+    }
+
+    function clearLog() {
+      logbox.textContent = '';
+      lastLog = '';
+    }
+
+    // Call endpoint to enable/disable debug flags
+    function toggleDebug(type, enable) {
+      let url = `/debug?type=${type}&enable=${enable ? '1' : '0'}`;
+      fetch(url)
+        .then(response => response.text())
+        .then(msg => {
+          // Optionally, append result to logs
+          logbox.textContent += `\n${msg}\n`;
+          logbox.scrollTop = logbox.scrollHeight;
+        })
+        .catch(err => {
+          logbox.textContent += `\nError setting debug: ${err}\n`;
+        });
+    }
+
+    // Poll logs every 2 seconds
+    setInterval(fetchLogs, 2000);
+    fetchLogs();
+  </script>
+</body>
+</html>
+)rawliteral";
+
 // --- Setup ---
 void setup() {
   Serial.begin(115200);
@@ -726,6 +862,34 @@ void setup() {
       Serial.setDebugOutput(false);
     }
 });
+
+  server.on("/logs", HTTP_GET, []() {
+    String logs;
+    for (size_t i = 0; i < LOG_BUFFER_SIZE; i++) {
+        logs += logBuffer[(logHead + i) % LOG_BUFFER_SIZE];
+    }
+    server.send(200, "text/plain", logs);
+  });
+  server.on("/logs.html", HTTP_GET, []() {
+  server.send(200, "text/html", logs_viewer_html);
+  });
+
+  server.on("/debug", HTTP_GET, []() {
+  String type = server.hasArg("type") ? server.arg("type") : "";
+  String enable = server.hasArg("enable") ? server.arg("enable") : "";
+  String msg;
+  if (type == "nmea") {
+    debugNMEA2000 = (enable == "1");
+    msg = "NMEA2000 debug " + String(debugNMEA2000 ? "enabled" : "disabled");
+  } else if (type == "rs485") {
+    debugRS485 = (enable == "1");
+    msg = "RS485 debug " + String(debugRS485 ? "enabled" : "disabled");
+  } else {
+    msg = "Unknown debug type";
+  }
+  server.send(200, "text/plain", msg);
+  });
+
 
   server.begin();
   Serial.println("HTTP server started");
