@@ -1,11 +1,5 @@
 /*
  * esp32 NMEA 2k to rs485 gateway
- * 
- * Author: caseyn
- * Date: 2025-09-11
- * 
- * added OTA updates
- * added log message output to webserver
  */
 
 #include <ESP32-TWAI-CAN.hpp>
@@ -15,13 +9,15 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoOTA.h>
+//added for debug
+#include "rs485_logger.h"
 
 // Version information
 #define SW_VERSION_MAJOR    1
-#define SW_VERSION_MINOR    5
-#define SW_VERSION_PATCH    1
-#define SW_VERSION_STRING   "v1.5.1"
-#define SW_BUILD_DATE       "2025-09-11"
+#define SW_VERSION_MINOR    7
+#define SW_VERSION_PATCH    5
+#define SW_VERSION_STRING   "v1.7.5"
+#define SW_BUILD_DATE       "2025-10-15"
 
 // --- CAN Bus Definitions ---
 #define CAN_TX      5
@@ -50,11 +46,13 @@ const char *password = "123456789";
 WebServer server(80);
 
 // --- Debug Output Control ---
-bool debugNMEA2000 = false; // Set true for verbose NMEA 2000 (CAN) debug
-bool debugRS485 = false;    // Set true for verbose RS485 debug
+bool debugNMEA2000 = true; // Set true for verbose NMEA 2000 (CAN) debug
+bool debugRS485 = true;    // Set true for verbose RS485 debug
 
-#define DEBUG_PRINT_NMEA2000(...) do { if (debugNMEA2000) Serial.printf(__VA_ARGS__); } while (0)
-#define DEBUG_PRINT_RS485(...) do { if (debugRS485) Serial.printf(__VA_ARGS__); } while (0)
+#define DEBUG_PRINT_NMEA2000(...) do { if (debugNMEA2000) logMessage(__VA_ARGS__); } while (0)
+#define DEBUG_PRINT_RS485(...) do { if (debugRS485) logMessage(__VA_ARGS__); } while (0)
+//#define DEBUG_PRINT_NMEA2000(...) do { if (debugNMEA2000) Serial.printf(__VA_ARGS__); } while (0)
+//#define DEBUG_PRINT_RS485(...) do { if (debugRS485) Serial.printf(__VA_ARGS__); } while (0)
 
 #define LOG_BUFFER_SIZE 4096
 char logBuffer[LOG_BUFFER_SIZE];
@@ -83,7 +81,7 @@ uint8_t toggle_bit = 0;
 
 // --- timeouts and defaults
 unsigned long nmeaDepthTimeoutMs = 5000; // Default: 5 seconds
-uint16_t depth_timeout_value = 0;         // Value when timeout occurs (e.g., 0 = no depth)
+uint16_t depth_timeout_value = 0;         // Value when timeout occurs
 unsigned long lastDepthReceivedMs = 0;
 bool depth_valid = false;
 
@@ -335,34 +333,74 @@ void canReceiver() {
 }
 
 // --- RS485 Request/Response Handling ---
-void readAndProcessRS485Message() {
-    static uint8_t messageBuffer[32];
-    static uint8_t currentByteIndex = 0;
-    static uint8_t expectedLen = 0;
+// --- RS485 Robust Request/Response Handling with Recovery and Resync ---
+// Debug macro for misalignment/drops
+#define DEBUG_RS485_RESYNC(...) do { if (enableRS485Logging) rs485LogPrint(__VA_ARGS__); } while (0)
 
-    while (RS485Serial.available()) {
+void readAndProcessRS485Message() {
+    static uint8_t rxBuffer[164];         // Reception buffer for incoming bytes (changed from 128 to 164)
+    static uint8_t bufferLen = 0;         // Number of bytes currently in buffer
+
+    // Read all available bytes from RS485 into rxBuffer
+    while (RS485Serial.available() && bufferLen < sizeof(rxBuffer)) {
         uint8_t b = RS485Serial.read();
-        if (currentByteIndex == 0) {
-            expectedLen = b;
-            if (expectedLen > 32 || expectedLen < 4) {
-                currentByteIndex = 0;
-                expectedLen = 0;
-                continue;
+        rs485LogByte(b, bufferLen, millis()); // Log every byte for analysis
+        rxBuffer[bufferLen++] = b;
+    }
+
+    uint8_t scanPos = 0;
+    int misalignments = 0;
+    int drops = 0;
+
+    // Try to extract as many valid frames as possible
+    while (bufferLen - scanPos >= 4) { // Minimum plausible message length
+        uint8_t lenByte = rxBuffer[scanPos];
+        // Check if the length byte is plausible for your protocol
+        if (lenByte < 4 || lenByte > 32) {
+            DEBUG_RS485_RESYNC("[RS485][MISALIGN] idx:%u byte:0x%02X at %lu ms\n", scanPos, lenByte, millis());
+            // Log the next 8 bytes for context
+            DEBUG_RS485_RESYNC("[RS485][MISALIGN] context:");
+            for (uint8_t i = 0; i < 8 && (scanPos + i) < bufferLen; i++) {
+                rs485LogPrint(" %02X", rxBuffer[scanPos + i]);
             }
+            rs485LogPrint("\n");
+            misalignments++;
+            scanPos++;
+            continue;
         }
-        if (currentByteIndex < 32) {
-            messageBuffer[currentByteIndex++] = b;
+        // Do we have enough bytes for a full message?
+        if (bufferLen - scanPos < lenByte) {
+            // Wait for more bytes to arrive
+            break;
         }
-        if (currentByteIndex >= expectedLen) {
-            // Verify checksum if present
-            if (verifyRS485Checksum(messageBuffer, expectedLen)) {
-                storeRS485Message(messageBuffer, expectedLen);
-            } else {
-                DEBUG_PRINT_RS485("[RS485] Checksum failed. Ignoring message.\n");
+        // Candidate message: rxBuffer[scanPos .. scanPos+lenByte-1]
+        uint8_t* msg = rxBuffer + scanPos;
+        if (verifyRS485Checksum(msg, lenByte)) {
+            // Valid message, process it!
+            storeRS485Message(msg, lenByte);
+            scanPos += lenByte; // Jump to next possible frame
+        } else {
+            // Log failed message
+            DEBUG_RS485_RESYNC("[RS485][DROP] idx:%u len:%u, bytes:", scanPos, lenByte);
+            for (uint8_t i = 0; i < lenByte; i++) {
+                rs485LogPrint(" %02X", msg[i]);
             }
-            currentByteIndex = 0;
-            expectedLen = 0;
+            rs485LogPrint(" at %lu ms\n", millis());
+            drops++;
+            scanPos++; // Try next byte as start
         }
+    }
+    // Remove processed or skipped bytes from buffer
+    if (scanPos > 0) {
+        if (scanPos < bufferLen) {
+            memmove(rxBuffer, rxBuffer + scanPos, bufferLen - scanPos);
+        }
+        bufferLen -= scanPos;
+    }
+
+    // Optionally log summary for this round
+    if (misalignments > 0 || drops > 0) {
+        DEBUG_RS485_RESYNC("[RS485][SUMMARY] misalignments:%d drops:%d at %lu ms\n", misalignments, drops, millis());
     }
 }
 
@@ -375,15 +413,13 @@ bool validateMessage(uint8_t* msg, uint8_t len) {
 }
 
 void storeRS485Message(uint8_t* msg, uint8_t len) {
-  DEBUG_PRINT_RS485("RS485: Processing message (len: %d)\n", len);
-  if (debugRS485) {
-    Serial.print("HEX: ");
-    for (int i = 0; i < len; i++) { Serial.printf("%02X ", msg[i]); }
-    Serial.println();
-  }
+    DEBUG_PRINT_RS485("RS485: Processing message (len: %d)\n", len);
+    DEBUG_PRINT_RS485("HEX: ");
+    for (int i = 0; i < len; i++) { DEBUG_PRINT_RS485("%02X ", msg[i]); }
+    DEBUG_PRINT_RS485("\n");
 
     // Only handle depth requests: 04 09 XX XX
-    if (len == REQUEST_LEN && msg[0] == MSG_TYPE_REQUEST && msg[1] == MSG_CMD_GET_DEPTH) {
+    if (len == 4 && msg[0] == 0x04 && msg[1] == 0x09) {
         DEBUG_PRINT_RS485("[RS485] Depth request received. Sending response.\n");
         sendDepthData();
         toggle_bit ^= 1;
@@ -513,6 +549,122 @@ void printHelp() {
   Serial.println("  debug nmea off   - Disable NMEA 2000 (CAN) debug output");
   Serial.println("  debug rs485 on   - Enable RS485 debug output");
   Serial.println("  debug rs485 off  - Disable RS485 debug output");
+}
+
+String generateMainPageHtml() {
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>ESP32 NMEA2K/RS485 Gateway</title>
+    <style>
+      body {
+        background: #181a1b;
+        color: #f1f1f1;
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 0;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: flex-start;
+      }
+      h2, h3 { color: #90caf9; }
+      .info-box {
+        background: #23272a;
+        padding: 2em 2.5em;
+        border-radius: 12px;
+        box-shadow: 0 2px 16px #000a;
+        margin: 2em 0 1em 0;
+        min-width: 320px;
+        width: 90vw;
+        max-width: 500px;
+        display: flex;
+        flex-direction: column;
+        gap: 0.8em;
+      }
+      .deep {
+        font-size: 1.2em;
+        color: #b0f2bc;
+      }
+      .ota-form {
+        margin: 2em 0 1em 0;
+      }
+      input[type='file'] {
+        color: #f1f1f1;
+        background: #181a1b;
+        border: 1px solid #444;
+        border-radius: 6px;
+        padding: 0.5em;
+      }
+      input[type='submit'] {
+        background: #1976d2;
+        color: #f1f1f1;
+        padding: 0.7em 2em;
+        border: none;
+        border-radius: 6px;
+        font-size: 1em;
+        cursor: pointer;
+        transition: background 0.2s;
+      }
+      input[type='submit']:hover {
+        background: #1565c0;
+      }
+      .links {
+        margin-top: 1em;
+        font-size: 1em;
+      }
+      a {
+        color: #90caf9;
+        text-decoration: underline;
+        margin: 0 0.5em;
+      }
+      a:hover { color: #1976d2; }
+    </style>
+  </head>
+  <body>
+    <h2>ESP32 NMEA2K to RS485 Gateway</h2>
+    <div class="info-box">
+      <div><b>Firmware Version:</b> )rawliteral";
+    html += SW_VERSION_STRING;
+    html += " (Build: ";
+    html += SW_BUILD_DATE;
+    html += ")</div>\n";
+    html += "<div><b>Uptime:</b> ";
+    unsigned long ms = millis();
+    unsigned long sec = ms / 1000;
+    unsigned long min = sec / 60;
+    unsigned long hr  = min / 60;
+    char uptimeStr[32];
+    snprintf(uptimeStr, sizeof(uptimeStr), "%02lu:%02lu:%02lu", hr, min % 60, sec % 60);
+    html += uptimeStr;
+    html += " (hh:mm:ss)</div>\n";
+    html += "<div class=\"deep\"><b>Latest Depth:</b> ";
+    if (depth_valid && (millis() - lastDepthReceivedMs < nmeaDepthTimeoutMs)) {
+        char depthStr[40];
+        snprintf(depthStr, sizeof(depthStr), "%.1f ft (%.2f m) <small>(PGN 128267)</small>", depth_tenths / 10.0, currentDepth.currentDepth);
+        html += depthStr;
+    } else {
+        html += "<i>not available</i>";
+    }
+    html += "</div>\n";
+    html += "</div>\n";
+    html += R"rawliteral(
+    <div class="ota-form">
+      <h3>OTA Firmware Update</h3>
+      <form method='POST' action='/update' enctype='multipart/form-data'>
+        <input type='file' name='update'>
+        <input type='submit' value='Update'>
+      </form>
+    </div>
+    <div class="links">
+      <a href="/logs.html">View Logs</a>
+    </div>
+  </body>
+</html>
+)rawliteral";
+    return html;
 }
 
 const char* ota_upload_form = R"rawliteral(
@@ -751,7 +903,6 @@ const char* logs_viewer_html = R"rawliteral(
 // --- Setup ---
 void setup() {
   Serial.begin(115200);
-  while (!Serial) { ; }
 
   Serial.println("\n\n--- esp32 NMEA2k RS485 gateway ---");
   Serial.printf("FW Version: %s (Build: %s)", SW_VERSION_STRING, SW_BUILD_DATE);
@@ -767,7 +918,7 @@ void setup() {
   ESP32Can.setPins(CAN_TX, CAN_RX);
   Serial.println("Starting NMEA 2000...");
   Serial.printf("NMEA 2000 initialized at %d kbps \n", CAN_SPEED);
-  Serial.printf("   CAN_H: GPIO%d, CAN_L: GPIO%d\n", 
+  Serial.printf("   CAN_TX: GPIO%d, CAN_RX: GPIO%d\n", 
                 CAN_TX, CAN_RX);
   if (!ESP32Can.begin(ESP32Can.convertSpeed(CAN_SPEED))) {
     Serial.println("CAN bus failed to start!");
@@ -780,7 +931,7 @@ void setup() {
 
   // Web Server routes
   server.on("/", HTTP_GET, []() {
-  server.send(200, "text/html", ota_upload_form);
+  server.send(200, "text/html", generateMainPageHtml());
   });
 
   server.onNotFound([]() {
@@ -861,7 +1012,7 @@ void setup() {
       }
       Serial.setDebugOutput(false);
     }
-});
+  });
 
   server.on("/logs", HTTP_GET, []() {
     String logs;
@@ -890,6 +1041,9 @@ void setup() {
   server.send(200, "text/plain", msg);
   });
 
+  server.on("/rs485logs", HTTP_GET, []() {
+    server.send(200, "text/plain", getRS485Logs());
+  });
 
   server.begin();
   Serial.println("HTTP server started");
@@ -901,6 +1055,6 @@ void loop() {
   ArduinoOTA.handle();
   canReceiver();
   readAndProcessRS485Message();
-  handleSerialCommands();
+  //handleSerialCommands();
   server.handleClient();
 }
