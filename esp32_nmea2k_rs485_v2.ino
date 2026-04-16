@@ -22,7 +22,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.3.2"
+#define SW_VERSION_STRING  "v2.3.3"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -253,7 +253,10 @@ void handleStatus() {
     <tr><td>Depth</td><td id='depth'>-</td></tr>
     <tr><td>Depth valid</td><td id='valid'>-</td></tr>
     <tr><td>CAN depth frames</td><td id='drx'>-</td></tr>
+    <tr><td>Last CAN depth</td><td id='dage'>-</td></tr>
     <tr><td>RS485 requests</td><td id='req'>-</td></tr>
+    <tr><td>Last RS485 request</td><td id='reqage'>-</td></tr>
+    <tr><td>Last RS485 reply</td><td id='txage'>-</td></tr>
     <tr><td>RS485 bad</td><td id='bad'>-</td></tr>
   </table>
   <br><a href='/'>Firmware Update</a>
@@ -268,7 +271,10 @@ function update(){
     el.textContent=d.depth_valid?'yes':'no (stale)';
     el.className=d.depth_valid?'':'stale';
     document.getElementById('drx').textContent=d.depth_rx;
+    document.getElementById('dage').textContent=d.depth_age_ms<0?'never':d.depth_age_ms+'ms ago';
     document.getElementById('req').textContent=d.rs485_req;
+    document.getElementById('reqage').textContent=d.rs485_req_age_ms<0?'never':d.rs485_req_age_ms+'ms ago';
+    document.getElementById('txage').textContent=d.rs485_tx_age_ms<0?'never':d.rs485_tx_age_ms+'ms ago';
     document.getElementById('bad').textContent=d.rs485_bad;
   }).catch(()=>{});
 }
@@ -289,7 +295,10 @@ void handleData() {
     json += "\"depth_ft\":" + String(depthTenths / 10.0f, 1) + ",";
     json += "\"depth_valid\":" + String(stale ? "false" : "true") + ",";
     json += "\"depth_rx\":" + String(statDepthRx) + ",";
+    json += "\"depth_age_ms\":" + String(lastDepthRxMs ? (int32_t)(now - lastDepthRxMs) : -1) + ",";
     json += "\"rs485_req\":" + String(statRS485Req) + ",";
+    json += "\"rs485_req_age_ms\":" + String(lastRS485ReqMs ? (int32_t)(now - lastRS485ReqMs) : -1) + ",";
+    json += "\"rs485_tx_age_ms\":" + String(lastRS485TxMs ? (int32_t)(now - lastRS485TxMs) : -1) + ",";
     json += "\"rs485_bad\":" + String(statRS485Bad);
     json += "}";
     server.sendHeader("Access-Control-Allow-Origin", "*");
