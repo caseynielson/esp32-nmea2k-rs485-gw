@@ -101,9 +101,11 @@ Connect to WiFi AP **`nmea2k_rs485_gw`** (password `123456789`) then:
 
 | URL            | Description                        |
 |----------------|------------------------------------|
-| `http://192.168.4.1/`          | OTA firmware update page |
+| `http://192.168.4.1/`          | Firmware update (HTTP file upload) |
 | `http://192.168.4.1/logs.html` | Live log viewer with debug toggles |
 | `http://192.168.4.1/status`    | JSON status (depth, stats, uptime) |
+
+> **Note:** ArduinoOTA (UDP/mDNS) is intentionally disabled — `ArduinoOTA.begin()` starts a background mDNS task that interferes with USB-CDC serial and causes Arduino IDE lockup on upload. Use the HTTP `/update` page for firmware updates instead.
 
 ### `/status` JSON example
 
@@ -150,7 +152,7 @@ canplayer replays .log  ────────▶ receives PGN 128267  ◀─�
 
 - [ESP32-TWAI-CAN](https://github.com/handmade0octopus/ESP32-TWAI-CAN)
 - Arduino ESP32 core ≥ 2.x
-- Standard Arduino libraries: `WiFi`, `WebServer`, `ArduinoOTA`, `Update`
+- Standard Arduino libraries: `WiFi`, `WebServer`, `Update`
 
 ## Building
 

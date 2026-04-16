@@ -41,11 +41,13 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <ArduinoOTA.h>
+// ArduinoOTA intentionally not used — ArduinoOTA.begin() starts mDNS
+// which interferes with USB-CDC serial and locks the Arduino IDE.
+// OTA updates are handled via HTTP POST /update instead.
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.1.3"
+#define SW_VERSION_STRING  "v2.1.4"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── CAN (NMEA 2000) ───────────────────────────────────────────────────────────
@@ -320,7 +322,7 @@ static void handleSerial() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 static void handleWeb() { server.handleClient(); }
-static void handleOTA() { ArduinoOTA.handle(); }
+// ArduinoOTA removed — OTA via HTTP POST /update
 
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -452,10 +454,6 @@ void setup() {
     WiFi.softAP(AP_SSID, AP_PASS);
     logMsg("WiFi AP  SSID=%s  IP=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
-    // OTA
-    ArduinoOTA.setHostname("nmea2k-rs485-gw");
-    ArduinoOTA.begin();
-
     // Web routes
     server.on("/", HTTP_GET, []() {
         server.send_P(200, "text/html", OTA_HTML);
@@ -512,10 +510,9 @@ void setup() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 void loop() {
-    handleRS485();        // 1st: check for MMDC request and respond immediately
-    drainLogToSerial();   // flush log buffer → Serial (single Serial owner)
-    drainCAN();           // drain full TWAI RX queue
-    handleSerial();       // serial console commands
-    handleWeb();          // web server (time-sliced, 5ms budget)
-    handleOTA();          // OTA handler  (time-sliced, 10ms budget)
+    handleRS485();       // 1st: check for MMDC request and respond immediately
+    drainLogToSerial();  // flush log buffer → Serial (single Serial owner)
+    drainCAN();          // drain full TWAI RX queue
+    handleSerial();      // serial debug toggle
+    handleWeb();         // web server
 }
