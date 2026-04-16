@@ -28,7 +28,7 @@
  *  CAN  : TJA1050 transceiver — TX→GPIO5, RX→GPIO4, 250 kbps
  *  RS485: MAX485 transceiver  — TX→GPIO17, RX→GPIO16, DE/RE→GPIO21, 76800 baud
  *  WiFi : Soft-AP  SSID "nmea2k_rs485_gw" / pw "123456789"
- *  OTA  : ArduinoOTA + HTTP POST /update
+ *  OTA  : HTTP POST /update (browser-based, no ArduinoOTA/mDNS)
  *  Logs : HTTP GET /logs.html  (live-polling log viewer)
  *  JSON : HTTP GET /status
  *
@@ -41,13 +41,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-// ArduinoOTA intentionally not used — ArduinoOTA.begin() starts mDNS
-// which interferes with USB-CDC serial and locks the Arduino IDE.
-// OTA updates are handled via HTTP POST /update instead.
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.1.4"
+#define SW_VERSION_STRING  "v2.1.5"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── CAN (NMEA 2000) ───────────────────────────────────────────────────────────
@@ -322,7 +319,6 @@ static void handleSerial() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 static void handleWeb() { server.handleClient(); }
-// ArduinoOTA removed — OTA via HTTP POST /update
 
 
 // ═════════════════════════════════════════════════════════════════════════════
