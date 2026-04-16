@@ -22,7 +22,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.3.3"
+#define SW_VERSION_STRING  "v2.3.4"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -59,9 +59,12 @@ static uint32_t lastDepthMs = 0;
 static uint8_t  toggleBit   = 0;
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
-static uint32_t statDepthRx  = 0;
-static uint32_t statRS485Req = 0;
-static uint32_t statRS485Bad = 0;
+static uint32_t statDepthRx   = 0;
+static uint32_t statRS485Req  = 0;
+static uint32_t statRS485Bad  = 0;
+static uint32_t lastDepthRxMs = 0;
+static uint32_t lastRS485ReqMs= 0;
+static uint32_t lastRS485TxMs = 0;
 
 // ── CAN ready flag — only set if ESP32Can.begin() succeeds ───────────────────
 static bool canReady = false;
@@ -108,6 +111,7 @@ static void sendDepthResponse() {
     resp[12] = calcChecksum(resp, 12);
     toggleBit ^= 1;
     statRS485Req++;
+    lastRS485TxMs = millis();
 
     rs485Tx();
     delayMicroseconds(200);
@@ -134,6 +138,7 @@ static void handleRS485() {
         if (verifyChecksum(buf, expected) &&
             buf[0] == MSG_TYPE_REQUEST &&
             buf[1] == MSG_CMD_DEPTH) {
+            lastRS485ReqMs = millis();
             sendDepthResponse();
         } else {
             statRS485Bad++;
@@ -163,7 +168,8 @@ static void handleDepth(const CanFrame &f) {
     depthTenths = (uint16_t)(depthFt * 10.0f + 0.5f);
     depthValid  = true;
     lastDepthMs = millis();
-    statDepthRx++;
+    lastDepthRxMs = millis();
+    statDepthRx++
 }
 
 static void drainCAN() {
@@ -288,10 +294,11 @@ update(); setInterval(update,1000);
 
 void handleData() {
     bool stale = !depthValid || ((millis() - lastDepthMs) > DEPTH_STALE_MS);
+    uint32_t now = millis();
     String json = "{";
     json += "\"firmware\":\"" + String(SW_VERSION_STRING) + "\",";
     json += "\"build_date\":\"" + String(SW_BUILD_DATE) + "\",";
-    json += "\"uptime_s\":" + String(millis() / 1000) + ",";
+    json += "\"uptime_s\":" + String(now / 1000) + ",";
     json += "\"depth_ft\":" + String(depthTenths / 10.0f, 1) + ",";
     json += "\"depth_valid\":" + String(stale ? "false" : "true") + ",";
     json += "\"depth_rx\":" + String(statDepthRx) + ",";
