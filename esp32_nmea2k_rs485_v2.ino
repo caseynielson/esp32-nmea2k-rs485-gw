@@ -22,7 +22,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.3.1"
+#define SW_VERSION_STRING  "v2.3.2"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -167,9 +167,11 @@ static void handleDepth(const CanFrame &f) {
 }
 
 static void drainCAN() {
-    if (!canReady) return;   // don't touch TWAI if init failed
+    if (!canReady) return;
+    // Single read per loop iteration — matches v1 behaviour.
+    // while() loop caused hangs with ESP32-TWAI-CAN library.
     CanFrame f;
-    while (ESP32Can.readFrame(f)) {
+    if (ESP32Can.readFrame(f)) {
         if (extractPGN(f.identifier) == 128267) handleDepth(f);
     }
 }
