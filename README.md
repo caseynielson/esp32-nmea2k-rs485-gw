@@ -160,6 +160,11 @@ Open `esp32_nmea2k_rs485_v2.ino` in Arduino IDE. Select board **ESP32 Dev Module
 
 ## Changelog
 
+### v2.0.1 — 2026-04-16
+- **Bugfix:** `logMsg()` no longer calls `Serial.write()` directly — was causing USB-CDC serial monitor lockup and Arduino IDE freeze when called from Core 1
+- Core 0 now owns all Serial output via `drainLogToSerial()` in `loop()`
+- Bumped `rs485Task` stack from 2 kB → 4 kB for headroom
+
 ### v2.0.0 — 2026-04-16
 - **Reliability fix:** RS485 response task pinned to Core 1 at priority 10 — completely decoupled from web server latency
 - **CAN:** `drainCAN()` now empties the full TWAI RX queue per loop iteration instead of reading one frame

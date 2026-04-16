@@ -41,7 +41,7 @@
 #include <Update.h>
 
 // ── Version ──────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.0.0"
+#define SW_VERSION_STRING  "v2.0.1"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── CAN (NMEA 2000) ──────────────────────────────────────────────────────────
@@ -69,9 +69,12 @@ static const char *AP_SSID = "nmea2k_rs485_gw";
 static const char *AP_PASS = "123456789";
 
 // ── Log ring buffer ───────────────────────────────────────────────────────────
+// Core 1 writes here via logMsg() (mutex-protected, no Serial calls).
+// Core 0 drains it to Serial in drainLogToSerial() once per loop().
 #define LOG_BUF_SIZE 4096
 static char     logBuf[LOG_BUF_SIZE];
-static size_t   logHead = 0;
+static size_t   logHead = 0;   // write pointer (producer)
+static size_t   logTail = 0;   // read pointer  (consumer, Core 0 only)
 static SemaphoreHandle_t logMutex;   // guards logBuf / logHead
 
 // ── Shared depth state ────────────────────────────────────────────────────────
@@ -100,6 +103,8 @@ WebServer      server(80);
 // Logging (thread-safe)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Write to ring buffer only — never touches Serial directly.
+// Safe to call from any core/task.
 static void logMsg(const char *fmt, ...) {
     char tmp[160];
     va_list ap;
@@ -108,14 +113,25 @@ static void logMsg(const char *fmt, ...) {
     va_end(ap);
     if (len <= 0) return;
 
-    Serial.write((uint8_t *)tmp, len);
-
     if (xSemaphoreTake(logMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         for (int i = 0; i < len; i++) {
             logBuf[logHead] = tmp[i];
             logHead = (logHead + 1) % LOG_BUF_SIZE;
         }
         xSemaphoreGive(logMutex);
+    }
+}
+
+// Drain any new ring-buffer bytes to Serial.
+// Called only from Core 0 (loop), so Serial is single-owner.
+static void drainLogToSerial() {
+    if (xSemaphoreTake(logMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+        size_t head = logHead;   // snapshot
+        xSemaphoreGive(logMutex);
+        while (logTail != head) {
+            Serial.write((uint8_t)logBuf[logTail]);
+            logTail = (logTail + 1) % LOG_BUF_SIZE;
+        }
     }
 }
 
@@ -563,11 +579,12 @@ void setup() {
     logMsg("HTTP server started\n");
 
     // ── RS485 real-time task on Core 1 ────────────────────────────────────────
-    // Stack 2 kB is plenty; priority 10 beats any Arduino default task.
+    // 4 kB stack — gives comfortable headroom for logMsg() formatting.
+    // Priority 10 beats any Arduino default task (loopTask runs at 1).
     xTaskCreatePinnedToCore(
         rs485Task,       // function
         "rs485",         // name
-        2048,            // stack bytes
+        4096,            // stack bytes
         nullptr,         // parameter
         10,              // priority (0=lowest, configMAX_PRIORITIES-1=highest)
         nullptr,         // handle (not needed)
@@ -584,6 +601,7 @@ void setup() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void loop() {
+    drainLogToSerial();   // Core 0 owns all Serial output
     ArduinoOTA.handle();
     drainCAN();           // drain full TWAI queue, not just one frame
     handleSerial();
