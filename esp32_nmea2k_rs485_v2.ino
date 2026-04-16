@@ -22,7 +22,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.3.5"
+#define SW_VERSION_STRING  "v2.3.6"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -53,10 +53,11 @@ HardwareSerial RS485Serial(2);
 // ── Depth state ───────────────────────────────────────────────────────────────
 #define DEPTH_STALE_MS   5000
 
-static uint16_t depthTenths = 0;
-static bool     depthValid  = false;
-static uint32_t lastDepthMs = 0;
-static uint8_t  toggleBit   = 0;
+static uint16_t depthTenths    = 0;  // current depth
+static uint16_t lastGoodTenths = 0;  // last valid depth, held when stale
+static bool     depthValid     = false;
+static uint32_t lastDepthMs    = 0;
+static uint8_t  toggleBit      = 0;
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 static uint32_t statDepthRx   = 0;
@@ -95,7 +96,11 @@ static inline void rs485Rx() { digitalWrite(RS485_DE_RE_PIN, LOW);  }
 
 static void sendDepthResponse() {
     bool     stale = !depthValid || ((millis() - lastDepthMs) > DEPTH_STALE_MS);
-    uint16_t d     = stale ? 0 : depthTenths;
+    // When stale: send last known good depth with toggle still flipping.
+    // The MMDC detects freshness via the toggle bit — keeping it alive while
+    // sending the last good value causes the display to blink that reading
+    // rather than showing 0.0 or blanking entirely.
+    uint16_t d = stale ? lastGoodTenths : depthTenths;
 
     uint8_t resp[RESPONSE_LEN] = {
         RESPONSE_LEN,
@@ -165,9 +170,10 @@ static void handleDepth(const CanFrame &f) {
     uint32_t rawM   = (uint32_t)f.data[1] | ((uint32_t)f.data[2]<<8) | ((uint32_t)f.data[3]<<16);
     float    depthM = rawM * 0.01f;
     float    depthFt= depthM * 3.28084f;
-    depthTenths = (uint16_t)(depthFt * 10.0f + 0.5f);
-    depthValid  = true;
-    lastDepthMs = millis();
+    depthTenths    = (uint16_t)(depthFt * 10.0f + 0.5f);
+    lastGoodTenths = depthTenths;  // update last-known-good
+    depthValid     = true;
+    lastDepthMs    = millis();
     lastDepthRxMs = millis();
     statDepthRx++;
 }
