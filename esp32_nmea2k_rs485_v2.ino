@@ -44,7 +44,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.1.6"
+#define SW_VERSION_STRING  "v2.1.7"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── CAN (NMEA 2000) ───────────────────────────────────────────────────────────
@@ -117,9 +117,12 @@ static void logMsg(const char *fmt, ...) {
     }
 }
 
-// Called first in loop() — drains new bytes to Serial in one shot
+// Drain log buffer to Serial — only when USB CDC is connected,
+// and capped at 64 bytes per loop() call so it never blocks the web server.
 static void drainLogToSerial() {
-    while (logTail != logHead) {
+    if (!Serial) return;   // USB CDC not connected — skip entirely
+    uint8_t budget = 64;
+    while (budget-- && logTail != logHead) {
         Serial.write((uint8_t)logBuf[logTail]);
         logTail = (logTail + 1) % LOG_BUF_SIZE;
     }
