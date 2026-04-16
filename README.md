@@ -123,15 +123,14 @@ Connect to WiFi AP **`nmea2k_rs485_gw`** (password `123456789`) then:
 
 ## Serial Console (115200 baud)
 
-| Command           | Description                         |
-|-------------------|-------------------------------------|
-| `depth`           | Print current depth and staleness   |
-| `stats`           | Print depth/RS485 counters, uptime  |
-| `debug nmea on`   | Enable verbose NMEA 2000 log output |
-| `debug nmea off`  | Disable NMEA 2000 log output        |
-| `debug rs485 on`  | Enable verbose RS485 log output     |
-| `debug rs485 off` | Disable RS485 log output            |
-| `help`            | Show command list                   |
+Serial commands are minimal — full debug control is available via the web interface at `/logs.html`.
+
+| Command     | Description                   |
+|-------------|-------------------------------|
+| `nmea on`   | Enable NMEA 2000 debug output |
+| `nmea off`  | Disable NMEA 2000 debug output|
+| `rs485 on`  | Enable RS485 debug output     |
+| `rs485 off` | Disable RS485 debug output    |
 
 ## Test Harness
 
