@@ -22,7 +22,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.3.4"
+#define SW_VERSION_STRING  "v2.3.5"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -169,7 +169,7 @@ static void handleDepth(const CanFrame &f) {
     depthValid  = true;
     lastDepthMs = millis();
     lastDepthRxMs = millis();
-    statDepthRx++
+    statDepthRx++;
 }
 
 static void drainCAN() {
