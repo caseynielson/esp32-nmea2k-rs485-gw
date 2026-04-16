@@ -45,7 +45,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.1.0"
+#define SW_VERSION_STRING  "v2.1.1"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── CAN (NMEA 2000) ───────────────────────────────────────────────────────────
@@ -297,25 +297,36 @@ static void drainCAN() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 static void handleSerial() {
-    if (!Serial.available()) return;
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if      (cmd == "debug nmea on")   { dbgNMEA  = true;  logMsg("NMEA debug ON\n"); }
-    else if (cmd == "debug nmea off")  { dbgNMEA  = false; logMsg("NMEA debug OFF\n"); }
-    else if (cmd == "debug rs485 on")  { dbgRS485 = true;  logMsg("RS485 debug ON\n"); }
-    else if (cmd == "debug rs485 off") { dbgRS485 = false; logMsg("RS485 debug OFF\n"); }
-    else if (cmd == "depth") {
-        bool stale = !depthValid || ((millis() - lastDepthMs) > DEPTH_STALE_MS);
-        logMsg("depth: %.1f ft (%s)\n", depthTenths / 10.0f, stale ? "STALE" : "fresh");
+    // Non-blocking: accumulate characters until newline, then dispatch.
+    // Handles both \n and \r\n (Arduino IDE serial monitor line endings).
+    static String cmd;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\r') continue;          // ignore CR, wait for LF
+        if (c != '\n') { cmd += c; continue; }  // accumulate
+
+        // Got newline — dispatch
+        cmd.trim();
+        if      (cmd == "debug nmea on")   { dbgNMEA  = true;  logMsg("NMEA debug ON\n"); }
+        else if (cmd == "debug nmea off")  { dbgNMEA  = false; logMsg("NMEA debug OFF\n"); }
+        else if (cmd == "debug rs485 on")  { dbgRS485 = true;  logMsg("RS485 debug ON\n"); }
+        else if (cmd == "debug rs485 off") { dbgRS485 = false; logMsg("RS485 debug OFF\n"); }
+        else if (cmd == "depth") {
+            bool stale = !depthValid || ((millis() - lastDepthMs) > DEPTH_STALE_MS);
+            logMsg("depth: %.1f ft (%s)\n", depthTenths / 10.0f, stale ? "STALE" : "fresh");
+        }
+        else if (cmd == "stats") {
+            logMsg("stats: depthRx=%lu rs485Req=%lu rs485Bad=%lu uptime=%.1fmin\n",
+                   statDepthRx, statRS485Req, statRS485Bad, millis() / 60000.0f);
+        }
+        else if (cmd == "help") {
+            logMsg("commands: depth | stats | debug nmea on/off | debug rs485 on/off | help\n");
+        }
+        else if (cmd.length() > 0) {
+            logMsg("unknown command '%s' (try 'help')\n", cmd.c_str());
+        }
+        cmd = "";
     }
-    else if (cmd == "stats") {
-        logMsg("stats: depthRx=%lu rs485Req=%lu rs485Bad=%lu uptime=%.1fmin\n",
-               statDepthRx, statRS485Req, statRS485Bad, millis() / 60000.0f);
-    }
-    else if (cmd == "help") {
-        logMsg("commands: depth | stats | debug nmea on/off | debug rs485 on/off | help\n");
-    }
-    else { logMsg("unknown command (try 'help')\n"); }
 }
 
 
