@@ -45,7 +45,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.1.2"
+#define SW_VERSION_STRING  "v2.1.3"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── CAN (NMEA 2000) ───────────────────────────────────────────────────────────
@@ -314,28 +314,13 @@ static void handleSerial() {
 
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Web server — time-sliced with a per-call budget to keep loop() fast
+// Web server + OTA — called every loop() iteration
+// Both are non-blocking when idle. handleRS485() runs first so any
+// RS485 request is serviced before these get a turn.
 // ═════════════════════════════════════════════════════════════════════════════
 
-// handleClient() is called on a millis() budget — if the web server needs
-// more time it will get it on the next iteration, but it cannot hog the loop.
-static uint32_t lastWebMs = 0;
-#define WEB_BUDGET_MS 5
-
-static void handleWeb() {
-    if ((millis() - lastWebMs) < WEB_BUDGET_MS) return;
-    lastWebMs = millis();
-    server.handleClient();
-}
-
-static uint32_t lastOtaMs = 0;
-#define OTA_BUDGET_MS 10
-
-static void handleOTA() {
-    if ((millis() - lastOtaMs) < OTA_BUDGET_MS) return;
-    lastOtaMs = millis();
-    ArduinoOTA.handle();
-}
+static void handleWeb() { server.handleClient(); }
+static void handleOTA() { ArduinoOTA.handle(); }
 
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -443,8 +428,9 @@ void setup() {
     Serial.begin(115200);
     delay(100);
 
-    logMsg("\n\n=== esp32 NMEA2k→RS485 Gateway %s (%s) ===\n",
-           SW_VERSION_STRING, SW_BUILD_DATE);
+    // Direct print for startup banner — logMsg() won't drain until loop() starts
+    Serial.printf("\n\n=== esp32 NMEA2k\u2192RS485 Gateway %s (%s) ===\n",
+                  SW_VERSION_STRING, SW_BUILD_DATE);
 
     // RS485
     pinMode(RS485_DE_RE_PIN, OUTPUT);
