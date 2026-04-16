@@ -22,7 +22,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.3.0"
+#define SW_VERSION_STRING  "v2.3.1"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -62,6 +62,9 @@ static uint8_t  toggleBit   = 0;
 static uint32_t statDepthRx  = 0;
 static uint32_t statRS485Req = 0;
 static uint32_t statRS485Bad = 0;
+
+// ── CAN ready flag — only set if ESP32Can.begin() succeeds ───────────────────
+static bool canReady = false;
 
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -164,6 +167,7 @@ static void handleDepth(const CanFrame &f) {
 }
 
 static void drainCAN() {
+    if (!canReady) return;   // don't touch TWAI if init failed
     CanFrame f;
     while (ESP32Can.readFrame(f)) {
         if (extractPGN(f.identifier) == 128267) handleDepth(f);
@@ -339,8 +343,10 @@ void setup() {
     ESP32Can.setPins(CAN_TX_PIN, CAN_RX_PIN);
     if (!ESP32Can.begin(ESP32Can.convertSpeed(CAN_SPEED_KBPS))) {
         Serial.println("WARNING: CAN init failed - no NMEA2000 input");
+        canReady = false;
     } else {
         Serial.printf("NMEA2000 CAN ready %dkbps\n", CAN_SPEED_KBPS);
+        canReady = true;
     }
 
     Serial.println("Setup complete.");
