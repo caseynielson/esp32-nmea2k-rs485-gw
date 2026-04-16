@@ -32,24 +32,23 @@ NMEA 2000 network                ESP32 gateway               Medallion MMDC
 
 The original single-task loop ran `ArduinoOTA.handle()`, `server.handleClient()`, CAN reads, and RS485 reads all in sequence. The WebServer library introduces multi-millisecond latency spikes. If a spike happened between the MMDC sending its depth request and the ESP32 reading and responding, the display went blank.
 
-### The fix (v2.x)
+### The fix (v2.1+)
 
-Two-core split:
+No extra FreeRTOS tasks or core pinning — `xTaskCreatePinnedToCore` was causing USB-CDC serial monitor lockup in the Arduino IDE by starving the Arduino `loopTask` on Core 1.
+
+Instead, the loop is ordered so RS485 is always first:
 
 ```
-Core 1 — rs485Task (priority 10, dedicated)
-  Blocks on UART byte arrival.
-  Assembles 4-byte request, validates checksum, fires 13-byte response.
-  Turnaround time: < 1 ms.
-  Never preempted by web server or OTA.
-
-Core 0 — loop() (normal priority)
-  Drains full TWAI CAN RX queue each iteration (not just one frame).
-  Runs ArduinoOTA.handle(), server.handleClient(), serial console.
-  Latency spikes here are harmless.
+loop() order — every iteration:
+  1. handleRS485()      ← first, always. UART HW buffer holds bytes safely.
+  2. drainLogToSerial() ← Serial has one owner (loop task), no cross-core races.
+  3. drainCAN()         ← empties full TWAI queue, not just one frame.
+  4. handleSerial()     ← debug console.
+  5. handleWeb()        ← time-sliced: only runs if ≥5ms since last call.
+  6. handleOTA()        ← time-sliced: only runs if ≥10ms since last call.
 ```
 
-Shared state (`depthTenths`, `depthValid`, `lastDepthMs`) is protected by a FreeRTOS mutex so both cores can safely read and write.
+The web server and OTA handler are rate-limited with `millis()` guards so they cannot monopolize the loop. The UART hardware buffers incoming RS485 bytes between iterations, so no bytes are lost even if a web request takes a few milliseconds.
 
 ## RS485 Protocol (Medallion MMDC)
 
@@ -159,6 +158,12 @@ canplayer replays .log  ────────▶ receives PGN 128267  ◀─�
 Open `esp32_nmea2k_rs485_v2.ino` in Arduino IDE. Select board **ESP32 Dev Module** (or your specific variant). Flash normally or use the OTA update page after first flash.
 
 ## Changelog
+
+### v2.1.0 — 2026-04-16
+- **Bugfix:** Removed `xTaskCreatePinnedToCore` entirely — pinning rs485Task to Core 1 at priority 10 was starving the Arduino `loopTask` and causing USB-CDC serial monitor lockup / IDE freeze on upload
+- RS485 handling moved back to `loop()` as first call, time-sliced web/OTA handlers prevent them from blocking
+- No mutexes needed (single-task, single Serial owner)
+- `handleWeb()` and `handleOTA()` rate-limited with millis() guards (5ms and 10ms budgets)
 
 ### v2.0.1 — 2026-04-16
 - **Bugfix:** `logMsg()` no longer calls `Serial.write()` directly — was causing USB-CDC serial monitor lockup and Arduino IDE freeze when called from Core 1
