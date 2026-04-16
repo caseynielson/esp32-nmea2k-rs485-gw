@@ -44,7 +44,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.1.5"
+#define SW_VERSION_STRING  "v2.1.6"
 #define SW_BUILD_DATE      "2026-04-16"
 
 // ── CAN (NMEA 2000) ───────────────────────────────────────────────────────────
@@ -437,16 +437,7 @@ void setup() {
     logMsg("RS485 ready  %d baud  RX=GPIO%d TX=GPIO%d DE/RE=GPIO%d\n",
            RS485_BAUDRATE, RS485_RX_PIN, RS485_TX_PIN, RS485_DE_RE_PIN);
 
-    // CAN / NMEA 2000
-    ESP32Can.setPins(CAN_TX_PIN, CAN_RX_PIN);
-    if (!ESP32Can.begin(ESP32Can.convertSpeed(CAN_SPEED_KBPS))) {
-        logMsg("FATAL: CAN bus failed to start\n");
-        while (1) delay(1000);
-    }
-    logMsg("NMEA2000 ready  %d kbps  TX=GPIO%d RX=GPIO%d\n",
-           CAN_SPEED_KBPS, CAN_TX_PIN, CAN_RX_PIN);
-
-    // WiFi AP
+    // WiFi AP — init before CAN so web interface is always reachable
     WiFi.softAP(AP_SSID, AP_PASS);
     logMsg("WiFi AP  SSID=%s  IP=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
@@ -496,8 +487,18 @@ void setup() {
         server.send_P(404, "text/html", NOT_FOUND_HTML);
     });
     server.begin();
+    logMsg("HTTP server started\n");
 
-    logMsg("Setup complete. Type 'help' for commands.\n");
+    // CAN / NMEA 2000 — init last; non-fatal if bus not present
+    ESP32Can.setPins(CAN_TX_PIN, CAN_RX_PIN);
+    if (!ESP32Can.begin(ESP32Can.convertSpeed(CAN_SPEED_KBPS))) {
+        logMsg("WARNING: CAN bus failed to start — running without NMEA2000\n");
+    } else {
+        logMsg("NMEA2000 ready  %d kbps  TX=GPIO%d RX=GPIO%d\n",
+               CAN_SPEED_KBPS, CAN_TX_PIN, CAN_RX_PIN);
+    }
+
+    logMsg("Setup complete.\n");
 }
 
 
