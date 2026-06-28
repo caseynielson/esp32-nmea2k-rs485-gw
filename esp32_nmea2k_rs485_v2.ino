@@ -11,7 +11,7 @@
  *  WiFi : Soft-AP  SSID "nmea2k_rs485_gw" / pw "123456789"
  *
  * Author : caseyn
- * Version: 2.3.0  (2026-04-16)
+ * Version: 2.4.0  (2026-06-28)
  */
 
 #include <Arduino.h>
@@ -22,8 +22,8 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.3.6"
-#define SW_BUILD_DATE      "2026-04-16"
+#define SW_VERSION_STRING  "v2.4.0"
+#define SW_BUILD_DATE      "2026-06-28"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
 const char *ssid     = "nmea2k_rs485_gw";
@@ -35,6 +35,7 @@ WebServer server(80);
 #define CAN_TX_PIN     5
 #define CAN_RX_PIN     4
 #define CAN_SPEED_KBPS 250
+#define CAN_RETRY_MS   5000   // reattempt failed CAN init every 5 s
 
 // ── RS485 (MAX485) ────────────────────────────────────────────────────────────
 #define RS485_RX_PIN    16
@@ -53,26 +54,36 @@ HardwareSerial RS485Serial(2);
 // ── Depth state ───────────────────────────────────────────────────────────────
 #define DEPTH_STALE_MS   5000
 
-static uint16_t depthTenths    = 0;  // current depth
+static uint16_t depthTenths    = 0;  // current depth in tenths of a foot
 static uint16_t lastGoodTenths = 0;  // last valid depth, held when stale
 static bool     depthValid     = false;
 static uint32_t lastDepthMs    = 0;
 static uint8_t  toggleBit      = 0;
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
-static uint32_t statDepthRx   = 0;
-static uint32_t statRS485Req  = 0;
-static uint32_t statRS485Bad  = 0;
-static uint32_t lastDepthRxMs = 0;
-static uint32_t lastRS485ReqMs= 0;
-static uint32_t lastRS485TxMs = 0;
+static uint32_t statDepthRx    = 0;
+static uint32_t statRS485Req   = 0;
+static uint32_t statRS485Bad   = 0;
+static uint32_t lastDepthRxMs  = 0;
+static uint32_t lastRS485ReqMs = 0;
+static uint32_t lastRS485TxMs  = 0;
 
-// ── CAN ready flag — only set if ESP32Can.begin() succeeds ───────────────────
-static bool canReady = false;
+// ── CAN state ─────────────────────────────────────────────────────────────────
+static bool     canReady       = false;
+static uint32_t lastCanRetryMs = 0;
+static uint32_t statCanRetries = 0;
+
+// ── Raw RS485 RX sniffer — ring buffer of last 64 bytes seen on the bus ───────
+// Every byte received from RS485 (before framing/checksum) is captured here so
+// we can inspect exactly what the MMDC is sending via the /status page.
+#define RAW_RX_BUF_LEN 64
+static uint8_t  rawRxBuf[RAW_RX_BUF_LEN];
+static uint8_t  rawRxHead  = 0;   // next write slot (wraps)
+static uint32_t rawRxTotal = 0;   // total bytes ever captured
 
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Checksum — 8-bit two's complement
+// Helpers
 // ═════════════════════════════════════════════════════════════════════════════
 
 static uint8_t calcChecksum(const uint8_t *data, uint8_t len) {
@@ -84,6 +95,27 @@ static uint8_t calcChecksum(const uint8_t *data, uint8_t len) {
 static bool verifyChecksum(const uint8_t *msg, uint8_t len) {
     if (len < 2) return false;
     return calcChecksum(msg, len - 1) == msg[len - 1];
+}
+
+// Append one byte to the raw RX ring buffer (called for every byte read)
+static void rawCapture(uint8_t b) {
+    rawRxBuf[rawRxHead] = b;
+    rawRxHead = (rawRxHead + 1) % RAW_RX_BUF_LEN;
+    rawRxTotal++;
+}
+
+// Return the ring buffer as a hex string in chronological order
+static String rawRxHex() {
+    String  out;
+    out.reserve(RAW_RX_BUF_LEN * 2 + 4);
+    uint32_t count = (rawRxTotal < RAW_RX_BUF_LEN) ? rawRxTotal : RAW_RX_BUF_LEN;
+    uint8_t  start = (rawRxTotal < RAW_RX_BUF_LEN) ? 0 : rawRxHead;
+    char     hex[3];
+    for (uint32_t i = 0; i < count; i++) {
+        snprintf(hex, sizeof(hex), "%02X", rawRxBuf[(start + i) % RAW_RX_BUF_LEN]);
+        out += hex;
+    }
+    return out;
 }
 
 
@@ -113,16 +145,18 @@ static void sendDepthResponse() {
         0x02,
         0x00
     };
-    resp[12] = calcChecksum(resp, 12);
-    toggleBit ^= 1;
+    resp[12]     = calcChecksum(resp, 12);
+    toggleBit   ^= 1;
     statRS485Req++;
     lastRS485TxMs = millis();
 
     rs485Tx();
     delayMicroseconds(200);
     RS485Serial.write(resp, RESPONSE_LEN);
-    RS485Serial.flush();
-    delayMicroseconds(100);
+    RS485Serial.flush();       // wait for TX buffer to drain into UART shift register
+    delayMicroseconds(250);    // wait for the last byte's stop bit to fully clock out
+                                // (76800 baud → 1 byte ≈ 130 µs; 100 µs was too short
+                                //  and could clip the stop bit before DE drops)
     rs485Rx();
 }
 
@@ -133,7 +167,12 @@ static void handleRS485() {
 
     while (RS485Serial.available()) {
         uint8_t b = RS485Serial.read();
+        rawCapture(b);   // ← capture every byte before framing logic
+
         if (idx == 0) {
+            // First byte is the message length.
+            // We only handle 4-byte depth requests; anything else is discarded
+            // but still captured in rawRxBuf so we can see what the MMDC sends.
             if (b < 4 || b > REQUEST_LEN) continue;
             expected = b;
         }
@@ -171,17 +210,35 @@ static void handleDepth(const CanFrame &f) {
     float    depthM = rawM * 0.01f;
     float    depthFt= depthM * 3.28084f;
     depthTenths    = (uint16_t)(depthFt * 10.0f + 0.5f);
-    lastGoodTenths = depthTenths;  // update last-known-good
+    lastGoodTenths = depthTenths;
     depthValid     = true;
     lastDepthMs    = millis();
-    lastDepthRxMs = millis();
+    lastDepthRxMs  = millis();
     statDepthRx++;
+}
+
+// Retry CAN init every CAN_RETRY_MS if it failed at boot.
+// On NMEA 2000 networks the bus may not be stable within the first second
+// of power-on, so the initial begin() can fail even though hardware is fine.
+static void maybeRetryCAN() {
+    if (canReady) return;
+    uint32_t now = millis();
+    if (now - lastCanRetryMs < CAN_RETRY_MS) return;
+    lastCanRetryMs = now;
+    statCanRetries++;
+    if (ESP32Can.begin(ESP32Can.convertSpeed(CAN_SPEED_KBPS))) {
+        Serial.printf("CAN init OK on retry #%lu\n", statCanRetries);
+        canReady = true;
+    } else {
+        Serial.printf("CAN retry #%lu failed — will retry in %ds\n",
+                      statCanRetries, CAN_RETRY_MS / 1000);
+    }
 }
 
 static void drainCAN() {
     if (!canReady) return;
-    // Single read per loop iteration — matches v1 behaviour.
-    // while() loop caused hangs with ESP32-TWAI-CAN library.
+    // Single read per loop iteration — a while() loop caused hangs with
+    // the ESP32-TWAI-CAN library when the RX queue was large.
     CanFrame f;
     if (ESP32Can.readFrame(f)) {
         if (extractPGN(f.identifier) == 128267) handleDepth(f);
@@ -238,7 +295,6 @@ const char *update_success_html = R"rawliteral(
 )rawliteral";
 
 void handleStatus() {
-    bool stale = !depthValid || ((millis() - lastDepthMs) > DEPTH_STALE_MS);
     const char* html = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -247,12 +303,13 @@ void handleStatus() {
   <meta name='viewport' content='width=device-width, initial-scale=1'>
   <style>
     body{background:#181a1b;color:#f1f1f1;font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
-    .card{background:#23272a;border-radius:12px;padding:2em 2.5em;box-shadow:0 2px 16px #000a;min-width:320px;}
+    .card{background:#23272a;border-radius:12px;padding:2em 2.5em;box-shadow:0 2px 16px #000a;min-width:340px;max-width:500px;width:100%;}
     h2{color:#90caf9;margin-top:0;}
     table{width:100%;border-collapse:collapse;}
-    td{padding:8px 4px;border-bottom:1px solid #333;}
-    td:first-child{color:#90caf9;width:50%;}
-    .stale{color:#ef5350;}
+    td{padding:8px 4px;border-bottom:1px solid #333;vertical-align:top;}
+    td:first-child{color:#90caf9;width:48%;white-space:nowrap;}
+    .ok{color:#b0f2bc;} .err{color:#ef5350;} .warn{color:#ffcc80;}
+    .hex{font-family:monospace;font-size:0.8em;word-break:break-all;line-height:1.6;}
     a{color:#90caf9;}
   </style>
 </head>
@@ -262,35 +319,59 @@ void handleStatus() {
   <table>
     <tr><td>Firmware</td><td id='fw'>-</td></tr>
     <tr><td>Uptime</td><td id='up'>-</td></tr>
+    <tr><td>CAN (NMEA2000)</td><td id='can'>-</td></tr>
+    <tr><td>CAN retry count</td><td id='canr'>-</td></tr>
     <tr><td>Depth</td><td id='depth'>-</td></tr>
     <tr><td>Depth valid</td><td id='valid'>-</td></tr>
     <tr><td>CAN depth frames</td><td id='drx'>-</td></tr>
     <tr><td>Last CAN depth</td><td id='dage'>-</td></tr>
     <tr><td>RS485 requests</td><td id='req'>-</td></tr>
-    <tr><td>Last RS485 request</td><td id='reqage'>-</td></tr>
+    <tr><td>RS485 bad frames</td><td id='bad'>-</td></tr>
+    <tr><td>Last RS485 req</td><td id='reqage'>-</td></tr>
     <tr><td>Last RS485 reply</td><td id='txage'>-</td></tr>
-    <tr><td>RS485 bad</td><td id='bad'>-</td></tr>
+    <tr><td>Raw RX total</td><td id='rawtotal'>-</td></tr>
+    <tr>
+      <td colspan='2'>
+        <span style='color:#90caf9'>Raw RS485 RX (last 64 bytes)</span><br>
+        <span class='hex' id='raw'>-</span>
+      </td>
+    </tr>
   </table>
   <br><a href='/'>Firmware Update</a>
 </div>
 <script>
+function age(ms){ return ms < 0 ? 'never' : ms + 'ms ago'; }
 function update(){
   fetch('/data').then(r=>r.json()).then(d=>{
-    document.getElementById('fw').textContent=d.firmware;
-    document.getElementById('up').textContent=d.uptime_s+'s';
-    document.getElementById('depth').textContent=d.depth_ft+' ft';
-    var el=document.getElementById('valid');
-    el.textContent=d.depth_valid?'yes':'no (stale)';
-    el.className=d.depth_valid?'':'stale';
-    document.getElementById('drx').textContent=d.depth_rx;
-    document.getElementById('dage').textContent=d.depth_age_ms<0?'never':d.depth_age_ms+'ms ago';
-    document.getElementById('req').textContent=d.rs485_req;
-    document.getElementById('reqage').textContent=d.rs485_req_age_ms<0?'never':d.rs485_req_age_ms+'ms ago';
-    document.getElementById('txage').textContent=d.rs485_tx_age_ms<0?'never':d.rs485_tx_age_ms+'ms ago';
-    document.getElementById('bad').textContent=d.rs485_bad;
+    document.getElementById('fw').textContent = d.firmware;
+    document.getElementById('up').textContent = d.uptime_s + 's';
+    var can = document.getElementById('can');
+    can.textContent = d.can_ready ? 'ready' : 'NOT READY';
+    can.className = d.can_ready ? 'ok' : 'err';
+    document.getElementById('canr').textContent = d.can_retries;
+    document.getElementById('depth').textContent = d.depth_ft + ' ft';
+    var el = document.getElementById('valid');
+    el.textContent = d.depth_valid ? 'yes' : 'no (stale)';
+    el.className = d.depth_valid ? 'ok' : 'err';
+    document.getElementById('drx').textContent = d.depth_rx;
+    document.getElementById('dage').textContent = age(d.depth_age_ms);
+    document.getElementById('req').textContent = d.rs485_req;
+    document.getElementById('bad').textContent = d.rs485_bad;
+    var badEl = document.getElementById('bad');
+    badEl.textContent = d.rs485_bad;
+    badEl.className = d.rs485_bad > 0 ? 'warn' : '';
+    document.getElementById('reqage').textContent = age(d.rs485_req_age_ms);
+    document.getElementById('txage').textContent = age(d.rs485_tx_age_ms);
+    document.getElementById('rawtotal').textContent = d.raw_rx_total + ' bytes';
+    // format hex in groups of 4 bytes (8 hex chars) for readability
+    var h = d.raw_rx_hex;
+    var out = '';
+    for (var i = 0; i < h.length; i += 8) { out += h.substr(i, 8) + ' '; }
+    document.getElementById('raw').textContent = out.trim() || '(none yet)';
   }).catch(()=>{});
 }
-update(); setInterval(update,1000);
+update();
+setInterval(update, 1000);
 </script>
 </body>
 </html>
@@ -299,20 +380,24 @@ update(); setInterval(update,1000);
 }
 
 void handleData() {
-    bool stale = !depthValid || ((millis() - lastDepthMs) > DEPTH_STALE_MS);
-    uint32_t now = millis();
+    bool     stale = !depthValid || ((millis() - lastDepthMs) > DEPTH_STALE_MS);
+    uint32_t now   = millis();
     String json = "{";
-    json += "\"firmware\":\"" + String(SW_VERSION_STRING) + "\",";
-    json += "\"build_date\":\"" + String(SW_BUILD_DATE) + "\",";
-    json += "\"uptime_s\":" + String(now / 1000) + ",";
-    json += "\"depth_ft\":" + String(depthTenths / 10.0f, 1) + ",";
-    json += "\"depth_valid\":" + String(stale ? "false" : "true") + ",";
-    json += "\"depth_rx\":" + String(statDepthRx) + ",";
-    json += "\"depth_age_ms\":" + String(lastDepthRxMs ? (int32_t)(now - lastDepthRxMs) : -1) + ",";
-    json += "\"rs485_req\":" + String(statRS485Req) + ",";
+    json += "\"firmware\":\""    + String(SW_VERSION_STRING) + "\",";
+    json += "\"build_date\":\""  + String(SW_BUILD_DATE)     + "\",";
+    json += "\"uptime_s\":"      + String(now / 1000)        + ",";
+    json += "\"can_ready\":"     + String(canReady ? "true" : "false") + ",";
+    json += "\"can_retries\":"   + String(statCanRetries)    + ",";
+    json += "\"depth_ft\":"      + String(depthTenths / 10.0f, 1) + ",";
+    json += "\"depth_valid\":"   + String(stale ? "false" : "true") + ",";
+    json += "\"depth_rx\":"      + String(statDepthRx)       + ",";
+    json += "\"depth_age_ms\":"  + String(lastDepthRxMs  ? (int32_t)(now - lastDepthRxMs)  : -1) + ",";
+    json += "\"rs485_req\":"     + String(statRS485Req)      + ",";
     json += "\"rs485_req_age_ms\":" + String(lastRS485ReqMs ? (int32_t)(now - lastRS485ReqMs) : -1) + ",";
-    json += "\"rs485_tx_age_ms\":" + String(lastRS485TxMs ? (int32_t)(now - lastRS485TxMs) : -1) + ",";
-    json += "\"rs485_bad\":" + String(statRS485Bad);
+    json += "\"rs485_tx_age_ms\":"  + String(lastRS485TxMs  ? (int32_t)(now - lastRS485TxMs)  : -1) + ",";
+    json += "\"rs485_bad\":"     + String(statRS485Bad)      + ",";
+    json += "\"raw_rx_total\":"  + String(rawRxTotal)        + ",";
+    json += "\"raw_rx_hex\":\""  + rawRxHex()                + "\"";
     json += "}";
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "application/json", json);
@@ -339,7 +424,7 @@ void setup() {
     Serial.print("AP IP: ");
     Serial.println(WiFi.softAPIP());
 
-    // Web routes — same pattern as mefi project
+    // Web routes
     server.on("/", HTTP_GET, []() {
         server.send(200, "text/html", ota_upload_form);
     });
@@ -363,10 +448,13 @@ void setup() {
     server.begin();
     Serial.println("HTTP server started");
 
-    // CAN — non-fatal if not connected on bench
+    // CAN — non-fatal at boot; retried every CAN_RETRY_MS in loop()
+    // NMEA 2000 networks sometimes need a few seconds to stabilise after
+    // power-on, so begin() may fail even when hardware is physically fine.
     ESP32Can.setPins(CAN_TX_PIN, CAN_RX_PIN);
     if (!ESP32Can.begin(ESP32Can.convertSpeed(CAN_SPEED_KBPS))) {
-        Serial.println("WARNING: CAN init failed - no NMEA2000 input");
+        Serial.printf("WARNING: CAN init failed — will retry every %ds\n",
+                      CAN_RETRY_MS / 1000);
         canReady = false;
     } else {
         Serial.printf("NMEA2000 CAN ready %dkbps\n", CAN_SPEED_KBPS);
@@ -378,11 +466,12 @@ void setup() {
 
 
 // ═════════════════════════════════════════════════════════════════════════════
-// loop() — same pattern as mefi project
+// loop()
 // ═════════════════════════════════════════════════════════════════════════════
 
 void loop() {
-    handleRS485();
+    handleRS485();    // first, always — UART HW buffer holds bytes safely
+    maybeRetryCAN();  // no-op when canReady; retries CAN init every 5 s if needed
     drainCAN();
     server.handleClient();
 }

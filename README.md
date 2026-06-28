@@ -160,6 +160,13 @@ Open `esp32_nmea2k_rs485_v2.ino` in Arduino IDE. Select board **ESP32 Dev Module
 
 ## Changelog
 
+### v2.4.0 — 2026-06-28
+- **Bugfix:** Post-transmit DE/RE hold increased from 100 µs → 250 µs. At 76800 baud one byte takes ~130 µs to clock out of the UART shift register after `flush()` returns. The previous 100 µs could drop the driver enable before the stop bit finished, corrupting the last byte of every response.
+- **Feature:** CAN auto-retry — if `ESP32Can.begin()` fails at boot, `maybeRetryCAN()` reattempts every 5 s. NMEA 2000 networks can take a few seconds to stabilise after power-on, so the initial attempt can fail even when hardware is fine. Retry count visible on status page.
+- **Feature:** Raw RS485 RX sniffer — every byte received from the MMDC (before framing/checksum) is captured in a 64-byte ring buffer and displayed on the `/status` page as hex. Shows unknown message types that the current framer discards, making it possible to spot protocol issues without a logic analyser.
+- **Feature:** `/status` page now shows CAN ready state (green/red), CAN retry count, RS485 bad-frame count highlighted in amber, raw RX byte count, and the live raw hex dump.
+- **Feature:** `/data` JSON adds `can_ready`, `can_retries`, `raw_rx_total`, `raw_rx_hex` fields.
+
 ### v2.1.0 — 2026-04-16
 - **Bugfix:** Removed `xTaskCreatePinnedToCore` entirely — pinning rs485Task to Core 1 at priority 10 was starving the Arduino `loopTask` and causing USB-CDC serial monitor lockup / IDE freeze on upload
 - RS485 handling moved back to `loop()` as first call, time-sliced web/OTA handlers prevent them from blocking
