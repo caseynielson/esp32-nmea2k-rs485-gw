@@ -323,8 +323,8 @@ void handleStatus() {
     <tr><td>CAN retry count</td><td id='canr'>-</td></tr>
     <tr><td>Depth</td><td id='depth'>-</td></tr>
     <tr><td>Depth valid</td><td id='valid'>-</td></tr>
-    <tr><td>CAN depth frames</td><td id='drx'>-</td></tr>
-    <tr><td>Last CAN depth</td><td id='dage'>-</td></tr>
+    <tr><td>N2k depth frames</td><td id='drx'>-</td></tr>
+    <tr><td>Last N2k depth</td><td id='dage'>-</td></tr>
     <tr><td>RS485 requests</td><td id='req'>-</td></tr>
     <tr><td>RS485 bad frames</td><td id='bad'>-</td></tr>
     <tr><td>Last RS485 req</td><td id='reqage'>-</td></tr>
