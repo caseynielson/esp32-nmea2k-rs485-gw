@@ -22,7 +22,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.11.0"
+#define SW_VERSION_STRING  "v2.12.0"
 #define SW_BUILD_DATE      "2026-07-01"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -52,6 +52,8 @@ HardwareSerial RS485Serial(2);
 #define RESPONSE_LEN     13
 #define MSG_TYPE_REQUEST 0x04  // length byte value for a 4-byte depth-poll frame
 #define MSG_CMD_DEPTH    0x09
+#define MSG_CMD_PING     0x06  // 4-byte cmd=0x06 frame — appears every MMDC cycle before 0x09
+                           // hypothesis: responding to this refreshes the display timer
 
 // ── Depth state ───────────────────────────────────────────────────────────────
 #define DEPTH_STALE_MS   15000  // 5 s was too tight; transducer/TWAI gaps up to ~10 s are normal
@@ -65,14 +67,25 @@ static uint8_t  toggleBit      = 0;
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 static uint32_t statDepthRx      = 0;
-static uint32_t statRS485Req     = 0;
-static uint32_t statRS485CrcFail = 0;   // true checksum failures (wire noise / framing)
-static uint32_t statRS485Unknown = 0;   // valid frame, unrecognised command type
-static uint32_t statRS485StaleResp = 0; // responses sent with frozen toggle (N2k stale)
-static uint32_t lastDepthRxMs    = 0;
-static uint32_t lastRS485ReqMs = 0;
-static uint32_t lastRS485TxMs  = 0;
-static uint8_t  lastCrcFailBuf[4] = {0, 0, 0, 0};  // last 4-byte frame that failed CRC (debug)
+static uint32_t statRS485Req       = 0;  // depth poll (cmd=0x09) responses sent
+static uint32_t statRS485PingResp  = 0;  // cmd=0x06 ping responses sent
+static uint32_t statRS485CrcFail   = 0;  // true checksum failures (wire noise / framing)
+static uint32_t statRS485Unknown   = 0;  // valid frame, unrecognised command type
+static uint32_t statRS485StaleResp = 0;  // responses sent with stale/no N2k data
+static uint32_t lastDepthRxMs      = 0;
+static uint32_t lastRS485ReqMs     = 0;
+static uint32_t lastRS485PingMs    = 0;
+static uint32_t lastRS485TxMs      = 0;
+static uint8_t  lastCrcFailBuf[4]  = {0, 0, 0, 0};  // last 4-byte frame that failed CRC (debug)
+
+// ── Poll interval tracking ─────────────────────────────────────────────────────
+// Measures actual MMDC depth-poll (cmd=0x09) inter-arrival time.
+// Helps diagnose display-timer vs poll-rate mismatches.
+static uint32_t pollIntervalMin  = 0xFFFFFFFF;  // ms, reset to 0xFFFFFFFF at boot
+static uint32_t pollIntervalMax  = 0;
+static uint32_t pollIntervalSum  = 0;           // for running average
+static uint32_t pollIntervalCnt  = 0;
+static uint32_t lastPollArrivalMs = 0;
 
 // ── CAN state ─────────────────────────────────────────────────────────────────
 static bool     canReady       = false;
@@ -141,6 +154,8 @@ static String rawRxHex() {
 static inline void rs485Tx() { digitalWrite(RS485_DE_RE_PIN, HIGH); }
 static inline void rs485Rx() { digitalWrite(RS485_DE_RE_PIN, LOW);  }
 
+// Send our 13-byte depth response on RS485.
+// Used for both cmd=0x09 (depth poll) and cmd=0x06 (ping/keepalive).
 static void sendDepthResponse() {
     uint32_t now  = millis();
     // "acquired stale" = we had data but lost it (N2k went quiet mid-session)
@@ -174,7 +189,7 @@ static void sendDepthResponse() {
     };
     resp[12] = calcChecksum(resp, 12);
     toggleBit ^= 1;  // always alternate — frozen toggle = MMDC blanks DEPTH entirely
-    statRS485Req++;
+    statRS485Req++;  // caller may override — see sendPingResponse()
     lastRS485TxMs = millis();
 
     rs485Tx();
@@ -189,6 +204,20 @@ static void sendDepthResponse() {
     delayMicroseconds(300);    // wait for the last byte's stop bit to fully clock out
                                 // (76800 baud → 1 byte ≈ 130 µs; 300 µs gives full margin)
     rs485Rx();
+}
+
+// Ping response: same depth frame as poll response, but tracked separately.
+// cmd=0x06 appears every MMDC cycle just before the cmd=0x09 depth poll.
+// Hypothesis: responding to it refreshes the MMDC display timer so depth
+// stays visible between the slower (~2s) depth polls.
+static void sendPingResponse() {
+    // Reuse sendDepthResponse() for the frame — it already handles stale/fresh
+    // depth and always alternates the toggle.
+    // Undo the statRS485Req++ it adds (ping has its own counter).
+    sendDepthResponse();
+    statRS485Req--;        // un-count from depth-poll stat
+    statRS485PingResp++;   // count as ping instead
+    lastRS485PingMs = millis();
 }
 
 static void handleRS485() {
@@ -219,11 +248,25 @@ static void handleRS485() {
             memcpy(lastCrcFailBuf, buf, 4);  // capture first 4 bytes for /status debug
             statRS485CrcFail++;              // genuine wire error on a known-length frame
         } else if (buf[0] == MSG_TYPE_REQUEST && buf[1] == MSG_CMD_DEPTH) {
-            // 4-byte depth poll from MMDC — reply with current depth.
-            lastRS485ReqMs = millis();
+            // 4-byte depth poll (cmd=0x09) from MMDC — reply with current depth.
+            // Track inter-poll interval for display-timer diagnosis.
+            uint32_t now = millis();
+            if (lastPollArrivalMs > 0) {
+                uint32_t interval = now - lastPollArrivalMs;
+                if (interval < pollIntervalMin) pollIntervalMin = interval;
+                if (interval > pollIntervalMax) pollIntervalMax = interval;
+                pollIntervalSum += interval;
+                pollIntervalCnt++;
+            }
+            lastPollArrivalMs = now;
+            lastRS485ReqMs    = now;
             sendDepthResponse();
+        } else if (buf[0] == MSG_TYPE_REQUEST && buf[1] == MSG_CMD_PING) {
+            // 4-byte cmd=0x06 frame — appears each MMDC cycle before the depth poll.
+            // Respond with our depth frame to try to keep the display timer alive.
+            sendPingResponse();
         } else {
-            // Valid frame, not a depth poll — MMDC status broadcast, ignore.
+            // Valid frame, not a recognised command — MMDC status broadcast, ignore.
             statRS485Unknown++;
         }
         idx = expected = 0;
@@ -376,12 +419,15 @@ void handleStatus() {
     <tr><td>Depth state</td><td id='dstate'>-</td></tr>
     <tr><td>N2k depth frames</td><td id='drx'>-</td></tr>
     <tr><td>Last N2k depth</td><td id='dage'>-</td></tr>
-    <tr><td>RS485 requests</td><td id='req'>-</td></tr>
+    <tr><td>RS485 depth polls (0x09)</td><td id='req'>-</td></tr>
+    <tr><td>RS485 ping resp (0x06)</td><td id='pingresp'>-</td></tr>
+    <tr><td>Poll interval min/avg/max</td><td id='pollint'>-</td></tr>
     <tr><td>RS485 CRC failures</td><td id='crcfail'>-</td></tr>
     <tr><td>Last CRC fail frame</td><td id='crcfailhex' class='hex'>-</td></tr>
     <tr><td>RS485 unknown frames</td><td id='unknown'>-</td></tr>
     <tr><td>RS485 stale replies</td><td id='staleresp'>-</td></tr>
-    <tr><td>Last RS485 req</td><td id='reqage'>-</td></tr>
+    <tr><td>Last depth poll</td><td id='reqage'>-</td></tr>
+    <tr><td>Last ping (0x06)</td><td id='pingage'>-</td></tr>
     <tr><td>Last RS485 reply</td><td id='txage'>-</td></tr>
     <tr><td>Raw RX total</td><td id='rawtotal'>-</td></tr>
     <tr>
@@ -410,6 +456,11 @@ function update(){
     document.getElementById('drx').textContent = d.depth_rx;
     document.getElementById('dage').textContent = age(d.depth_age_ms);
     document.getElementById('req').textContent = d.rs485_req;
+    document.getElementById('pingresp').textContent = d.rs485_ping_resp;
+    var pi = d.poll_interval_cnt > 0
+      ? d.poll_interval_min_ms + '/' + Math.round(d.poll_interval_avg_ms) + '/' + d.poll_interval_max_ms + ' ms (' + d.poll_interval_cnt + ' samples)'
+      : '(no data yet)';
+    document.getElementById('pollint').textContent = pi;
     var crcEl = document.getElementById('crcfail');
     crcEl.textContent = d.rs485_crc_fail;
     crcEl.className = d.rs485_crc_fail > 0 ? 'err' : '';
@@ -421,6 +472,7 @@ function update(){
     staleEl.textContent = d.rs485_stale_resp;
     staleEl.className = d.rs485_stale_resp > 0 ? 'warn' : '';
     document.getElementById('reqage').textContent = age(d.rs485_req_age_ms);
+    document.getElementById('pingage').textContent = age(d.rs485_ping_age_ms);
     document.getElementById('txage').textContent = age(d.rs485_tx_age_ms);
     document.getElementById('rawtotal').textContent = d.raw_rx_total + ' bytes';
     // format hex in groups of 4 bytes (8 hex chars) for readability
@@ -457,13 +509,19 @@ void handleData() {
     json += "\"ever_had_depth\":"  + String(everHadDepth ? "true" : "false") + ",";
     json += "\"depth_rx\":"        + String(statDepthRx)       + ",";
     json += "\"depth_age_ms\":"    + String(lastDepthRxMs ? (int32_t)(now - lastDepthRxMs) : -1) + ",";
-    json += "\"rs485_req\":"     + String(statRS485Req)      + ",";
-    json += "\"rs485_req_age_ms\":" + String(lastRS485ReqMs ? (int32_t)(now - lastRS485ReqMs) : -1) + ",";
-    json += "\"rs485_tx_age_ms\":"  + String(lastRS485TxMs  ? (int32_t)(now - lastRS485TxMs)  : -1) + ",";
-    json += "\"rs485_crc_fail\":" + String(statRS485CrcFail)  + ",";
-    json += "\"rs485_unknown\":"  + String(statRS485Unknown)   + ",";
-    json += "\"rs485_last_crc_fail_hex\":\"" + lastCrcFailHex()      + "\",";
-    json += "\"rs485_stale_resp\":" + String(statRS485StaleResp) + ",";
+    json += "\"rs485_req\":"          + String(statRS485Req)       + ",";
+    json += "\"rs485_ping_resp\":"     + String(statRS485PingResp)  + ",";
+    json += "\"rs485_req_age_ms\":"    + String(lastRS485ReqMs  ? (int32_t)(now - lastRS485ReqMs)  : -1) + ",";
+    json += "\"rs485_ping_age_ms\":"   + String(lastRS485PingMs ? (int32_t)(now - lastRS485PingMs) : -1) + ",";
+    json += "\"rs485_tx_age_ms\":"     + String(lastRS485TxMs   ? (int32_t)(now - lastRS485TxMs)   : -1) + ",";
+    json += "\"rs485_crc_fail\":"      + String(statRS485CrcFail)   + ",";
+    json += "\"rs485_unknown\":"       + String(statRS485Unknown)    + ",";
+    json += "\"rs485_last_crc_fail_hex\":\"" + lastCrcFailHex() + "\",";
+    json += "\"rs485_stale_resp\":"    + String(statRS485StaleResp) + ",";
+    json += "\"poll_interval_cnt\":"   + String(pollIntervalCnt)    + ",";
+    json += "\"poll_interval_min_ms\":" + String(pollIntervalCnt ? pollIntervalMin : 0) + ",";
+    json += "\"poll_interval_max_ms\":" + String(pollIntervalMax)   + ",";
+    json += "\"poll_interval_avg_ms\":" + String(pollIntervalCnt ? (float)pollIntervalSum/pollIntervalCnt : 0.0f, 1) + ",";
     json += "\"raw_rx_total\":"  + String(rawRxTotal)        + ",";
     json += "\"raw_rx_hex\":\""  + rawRxHex()                + "\"";
     json += "}";
