@@ -11,7 +11,7 @@
  *  WiFi : Soft-AP  SSID "nmea2k_rs485_gw" / pw "123456789"
  *
  * Author : caseyn
- * Version: 2.4.0  (2026-06-28)
+ * Version: 2.6.0  (2026-06-28)
  */
 
 #include <Arduino.h>
@@ -22,8 +22,8 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.4.0"
-#define SW_BUILD_DATE      "2026-06-28"
+#define SW_VERSION_STRING  "v2.10.0"
+#define SW_BUILD_DATE      "2026-07-01"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
 const char *ssid     = "nmea2k_rs485_gw";
@@ -46,37 +46,43 @@ WebServer server(80);
 HardwareSerial RS485Serial(2);
 
 // ── RS485 protocol ────────────────────────────────────────────────────────────
-#define REQUEST_LEN      4
+#define FRAME_MAX_LEN    32   // largest MMDC frame we'll accept
+                          // observed: 19-byte display frames (Temp/Oil/Fuel) when engine running
+                          // MUST be ≥19; 32 gives comfortable headroom
 #define RESPONSE_LEN     13
-#define MSG_TYPE_REQUEST 0x04
+#define MSG_TYPE_REQUEST 0x04  // length byte value for a 4-byte depth-poll frame
 #define MSG_CMD_DEPTH    0x09
 
 // ── Depth state ───────────────────────────────────────────────────────────────
-#define DEPTH_STALE_MS   5000
+#define DEPTH_STALE_MS   15000  // 5 s was too tight; transducer/TWAI gaps up to ~10 s are normal
 
 static uint16_t depthTenths    = 0;  // current depth in tenths of a foot
 static uint16_t lastGoodTenths = 0;  // last valid depth, held when stale
 static bool     depthValid     = false;
+static bool     everHadDepth   = false; // true once we've received at least one valid N2k frame
 static uint32_t lastDepthMs    = 0;
 static uint8_t  toggleBit      = 0;
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
-static uint32_t statDepthRx    = 0;
-static uint32_t statRS485Req   = 0;
-static uint32_t statRS485Bad   = 0;
-static uint32_t lastDepthRxMs  = 0;
+static uint32_t statDepthRx      = 0;
+static uint32_t statRS485Req     = 0;
+static uint32_t statRS485CrcFail = 0;   // true checksum failures (wire noise / framing)
+static uint32_t statRS485Unknown = 0;   // valid frame, unrecognised command type
+static uint32_t statRS485StaleResp = 0; // responses sent with frozen toggle (N2k stale)
+static uint32_t lastDepthRxMs    = 0;
 static uint32_t lastRS485ReqMs = 0;
 static uint32_t lastRS485TxMs  = 0;
+static uint8_t  lastCrcFailBuf[4] = {0, 0, 0, 0};  // last 4-byte frame that failed CRC (debug)
 
 // ── CAN state ─────────────────────────────────────────────────────────────────
 static bool     canReady       = false;
 static uint32_t lastCanRetryMs = 0;
 static uint32_t statCanRetries = 0;
 
-// ── Raw RS485 RX sniffer — ring buffer of last 64 bytes seen on the bus ───────
+// ── Raw RS485 RX sniffer — ring buffer of last 128 bytes seen on the bus ──────
 // Every byte received from RS485 (before framing/checksum) is captured here so
 // we can inspect exactly what the MMDC is sending via the /status page.
-#define RAW_RX_BUF_LEN 64
+#define RAW_RX_BUF_LEN 128  // 128 bytes captures ~10 full 12-byte MMDC cycles
 static uint8_t  rawRxBuf[RAW_RX_BUF_LEN];
 static uint8_t  rawRxHead  = 0;   // next write slot (wraps)
 static uint32_t rawRxTotal = 0;   // total bytes ever captured
@@ -104,6 +110,15 @@ static void rawCapture(uint8_t b) {
     rawRxTotal++;
 }
 
+// Return the last CRC-failing frame as a hex string (for /status debugging)
+static String lastCrcFailHex() {
+    char out[9];
+    snprintf(out, sizeof(out), "%02X%02X%02X%02X",
+             lastCrcFailBuf[0], lastCrcFailBuf[1],
+             lastCrcFailBuf[2], lastCrcFailBuf[3]);
+    return String(out);
+}
+
 // Return the ring buffer as a hex string in chronological order
 static String rawRxHex() {
     String  out;
@@ -127,12 +142,28 @@ static inline void rs485Tx() { digitalWrite(RS485_DE_RE_PIN, HIGH); }
 static inline void rs485Rx() { digitalWrite(RS485_DE_RE_PIN, LOW);  }
 
 static void sendDepthResponse() {
-    bool     stale = !depthValid || ((millis() - lastDepthMs) > DEPTH_STALE_MS);
-    // When stale: send last known good depth with toggle still flipping.
-    // The MMDC detects freshness via the toggle bit — keeping it alive while
-    // sending the last good value causes the display to blink that reading
-    // rather than showing 0.0 or blanking entirely.
-    uint16_t d = stale ? lastGoodTenths : depthTenths;
+    uint32_t now  = millis();
+    // "acquired stale" = we had data but lost it (N2k went quiet mid-session)
+    // "boot stale"     = we never had data (engine just started, transducer out of water)
+    bool acquiredStale = everHadDepth && ((now - lastDepthMs) > DEPTH_STALE_MS);
+    bool fresh         = everHadDepth && !acquiredStale;
+
+    // What depth value to send:
+    //   fresh           → current reading from N2k
+    //   acquired stale  → last good reading (holds the display)
+    //   boot stale      → 0 (we have nothing; send 0.0 ft with live toggle so DEPTH field shows)
+    uint16_t d = fresh ? depthTenths : lastGoodTenths;
+
+    // Toggle behaviour:
+    //   fresh           → alternate every reply  → MMDC shows solid reading
+    //   acquired stale  → freeze toggle           → MMDC blinks/blanks (data old)
+    //   boot stale      → alternate every reply  → MMDC shows 0.0 ft solid
+    //                     Rationale: at boot the transducer is out of water; the Garmin
+    //                     won't have real depth anyway.  Keeping the toggle live lets
+    //                     the DEPTH field appear on the dash immediately after key-on
+    //                     instead of staying blank until the first valid N2k packet.
+    bool freezeToggle = acquiredStale;
+    if (freezeToggle) statRS485StaleResp++;
 
     uint8_t resp[RESPONSE_LEN] = {
         RESPONSE_LEN,
@@ -145,23 +176,27 @@ static void sendDepthResponse() {
         0x02,
         0x00
     };
-    resp[12]     = calcChecksum(resp, 12);
-    toggleBit   ^= 1;
+    resp[12] = calcChecksum(resp, 12);
+    if (!freezeToggle) toggleBit ^= 1;
     statRS485Req++;
     lastRS485TxMs = millis();
 
     rs485Tx();
-    delayMicroseconds(200);
+    delayMicroseconds(50);     // was 200 µs — reduced to respond within MMDC's RX window.
+                                // MAX485 DE propagation <1 µs; 50 µs is plenty to settle.
+                                // 200 µs was causing the response to arrive after the MMDC
+                                // had already timed out and resumed broadcasting, which caused
+                                // collision: toggle advanced on ESP32 but MMDC never saw it,
+                                // making every other response appear frozen → "No Response".
     RS485Serial.write(resp, RESPONSE_LEN);
     RS485Serial.flush();       // wait for TX buffer to drain into UART shift register
-    delayMicroseconds(250);    // wait for the last byte's stop bit to fully clock out
-                                // (76800 baud → 1 byte ≈ 130 µs; 100 µs was too short
-                                //  and could clip the stop bit before DE drops)
+    delayMicroseconds(300);    // wait for the last byte's stop bit to fully clock out
+                                // (76800 baud → 1 byte ≈ 130 µs; 300 µs gives full margin)
     rs485Rx();
 }
 
 static void handleRS485() {
-    static uint8_t buf[REQUEST_LEN];
+    static uint8_t buf[FRAME_MAX_LEN];
     static uint8_t idx      = 0;
     static uint8_t expected = 0;
 
@@ -170,22 +205,30 @@ static void handleRS485() {
         rawCapture(b);   // ← capture every byte before framing logic
 
         if (idx == 0) {
-            // First byte is the message length.
-            // We only handle 4-byte depth requests; anything else is discarded
-            // but still captured in rawRxBuf so we can see what the MMDC sends.
-            if (b < 4 || b > REQUEST_LEN) continue;
+            // First byte is the MMDC frame length (total bytes incl. length + checksum).
+            // Accept 4–FRAME_MAX_LEN; anything outside that range is skipped.
+            // Using FRAME_MAX_LEN (not 4) is critical: the MMDC sends 5-, 8-, 12-,
+            // and 13-byte status broadcasts that contain 0x04 as a *data* byte.
+            // When we only accepted length=4, those 0x04 data bytes were mistaken
+            // for frame-start bytes, generating spurious CRC failures.
+            // Accepting the true frame length consumes the whole message cleanly.
+            if (b < 4 || b > FRAME_MAX_LEN) continue;
             expected = b;
         }
         buf[idx++] = b;
         if (idx < expected) continue;
 
-        if (verifyChecksum(buf, expected) &&
-            buf[0] == MSG_TYPE_REQUEST &&
-            buf[1] == MSG_CMD_DEPTH) {
+        // Full frame received — verify checksum then dispatch.
+        if (!verifyChecksum(buf, expected)) {
+            memcpy(lastCrcFailBuf, buf, 4);  // capture first 4 bytes for /status debug
+            statRS485CrcFail++;              // genuine wire error on a known-length frame
+        } else if (buf[0] == MSG_TYPE_REQUEST && buf[1] == MSG_CMD_DEPTH) {
+            // 4-byte depth poll from MMDC — reply with current depth.
             lastRS485ReqMs = millis();
             sendDepthResponse();
         } else {
-            statRS485Bad++;
+            // Valid frame, not a depth poll — MMDC status broadcast, ignore.
+            statRS485Unknown++;
         }
         idx = expected = 0;
     }
@@ -206,12 +249,22 @@ static uint32_t extractPGN(uint32_t id) {
 
 static void handleDepth(const CanFrame &f) {
     if (f.data_length_code < 7) return;
-    uint32_t rawM   = (uint32_t)f.data[1] | ((uint32_t)f.data[2]<<8) | ((uint32_t)f.data[3]<<16);
-    float    depthM = rawM * 0.01f;
-    float    depthFt= depthM * 3.28084f;
+    // PGN 128267 depth field is 32-bit (bytes 1–4), resolution 0.01 m.
+    // Reading only 3 bytes missed the MSB and let N2K error/not-available
+    // codes (0xFFFFFFFF, etc.) pass the sanity check as huge valid depths.
+    // Those bogus values were stored in lastGoodTenths, then sent as signed
+    // 16-bit overflow (e.g. 0xFD50 = −688) which the MMDC clamps to 0 and blinks.
+    uint32_t rawM = (uint32_t)f.data[1] | ((uint32_t)f.data[2] << 8) |
+                    ((uint32_t)f.data[3] << 16) | ((uint32_t)f.data[4] << 24);
+    // Reject N2K “not available” (0xFFFFFFFF / 0xFFFFFFFE) and anything
+    // deeper than 300 m (30 000 raw units ≈ 984 ft) — clearly out of water.
+    if (rawM > 30000) return;
+    float depthM  = rawM * 0.01f;
+    float depthFt = depthM * 3.28084f;
     depthTenths    = (uint16_t)(depthFt * 10.0f + 0.5f);
     lastGoodTenths = depthTenths;
     depthValid     = true;
+    everHadDepth   = true;
     lastDepthMs    = millis();
     lastDepthRxMs  = millis();
     statDepthRx++;
@@ -237,10 +290,12 @@ static void maybeRetryCAN() {
 
 static void drainCAN() {
     if (!canReady) return;
-    // Single read per loop iteration — a while() loop caused hangs with
-    // the ESP32-TWAI-CAN library when the RX queue was large.
-    CanFrame f;
-    if (ESP32Can.readFrame(f)) {
+    // Drain up to 8 frames per call — avoids TWAI FIFO overflow when
+    // the loop stalls briefly on RS485/HTTP, without the unbounded while
+    // that caused hangs with large RX queues in the ESP32-TWAI-CAN library.
+    for (uint8_t i = 0; i < 8; i++) {
+        CanFrame f;
+        if (!ESP32Can.readFrame(f)) break;
         if (extractPGN(f.identifier) == 128267) handleDepth(f);
     }
 }
@@ -305,9 +360,9 @@ void handleStatus() {
     body{background:#181a1b;color:#f1f1f1;font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
     .card{background:#23272a;border-radius:12px;padding:2em 2.5em;box-shadow:0 2px 16px #000a;min-width:340px;max-width:500px;width:100%;}
     h2{color:#90caf9;margin-top:0;}
-    table{width:100%;border-collapse:collapse;}
-    td{padding:8px 4px;border-bottom:1px solid #333;vertical-align:top;}
-    td:first-child{color:#90caf9;width:48%;white-space:nowrap;}
+    table{width:100%;border-collapse:collapse;table-layout:fixed;}
+    td{padding:8px 4px;border-bottom:1px solid #333;vertical-align:top;overflow-wrap:break-word;word-break:break-word;}
+    td:first-child{color:#90caf9;width:48%;}
     .ok{color:#b0f2bc;} .err{color:#ef5350;} .warn{color:#ffcc80;}
     .hex{font-family:monospace;font-size:0.8em;word-break:break-all;line-height:1.6;}
     a{color:#90caf9;}
@@ -322,17 +377,20 @@ void handleStatus() {
     <tr><td>CAN (NMEA2000)</td><td id='can'>-</td></tr>
     <tr><td>CAN retry count</td><td id='canr'>-</td></tr>
     <tr><td>Depth</td><td id='depth'>-</td></tr>
-    <tr><td>Depth valid</td><td id='valid'>-</td></tr>
+    <tr><td>Depth state</td><td id='dstate'>-</td></tr>
     <tr><td>N2k depth frames</td><td id='drx'>-</td></tr>
     <tr><td>Last N2k depth</td><td id='dage'>-</td></tr>
     <tr><td>RS485 requests</td><td id='req'>-</td></tr>
-    <tr><td>RS485 bad frames</td><td id='bad'>-</td></tr>
+    <tr><td>RS485 CRC failures</td><td id='crcfail'>-</td></tr>
+    <tr><td>Last CRC fail frame</td><td id='crcfailhex' class='hex'>-</td></tr>
+    <tr><td>RS485 unknown frames</td><td id='unknown'>-</td></tr>
+    <tr><td>RS485 stale replies</td><td id='staleresp'>-</td></tr>
     <tr><td>Last RS485 req</td><td id='reqage'>-</td></tr>
     <tr><td>Last RS485 reply</td><td id='txage'>-</td></tr>
     <tr><td>Raw RX total</td><td id='rawtotal'>-</td></tr>
     <tr>
       <td colspan='2'>
-        <span style='color:#90caf9'>Raw RS485 RX (last 64 bytes)</span><br>
+        <span style='color:#90caf9'>Raw RS485 RX (last 128 bytes)</span><br>
         <span class='hex' id='raw'>-</span>
       </td>
     </tr>
@@ -350,16 +408,22 @@ function update(){
     can.className = d.can_ready ? 'ok' : 'err';
     document.getElementById('canr').textContent = d.can_retries;
     document.getElementById('depth').textContent = d.depth_ft + ' ft';
-    var el = document.getElementById('valid');
-    el.textContent = d.depth_valid ? 'yes' : 'no (stale)';
-    el.className = d.depth_valid ? 'ok' : 'err';
+    var el = document.getElementById('dstate');
+    el.textContent = d.depth_state;
+    el.className = d.depth_state === 'fresh' ? 'ok' : (d.depth_state === 'boot_no_data' ? 'warn' : 'err');
     document.getElementById('drx').textContent = d.depth_rx;
     document.getElementById('dage').textContent = age(d.depth_age_ms);
     document.getElementById('req').textContent = d.rs485_req;
-    document.getElementById('bad').textContent = d.rs485_bad;
-    var badEl = document.getElementById('bad');
-    badEl.textContent = d.rs485_bad;
-    badEl.className = d.rs485_bad > 0 ? 'warn' : '';
+    var crcEl = document.getElementById('crcfail');
+    crcEl.textContent = d.rs485_crc_fail;
+    crcEl.className = d.rs485_crc_fail > 0 ? 'err' : '';
+    document.getElementById('crcfailhex').textContent = d.rs485_last_crc_fail_hex || '-';
+    var unkEl = document.getElementById('unknown');
+    unkEl.textContent = d.rs485_unknown;
+    unkEl.className = d.rs485_unknown > 0 ? 'warn' : '';
+    var staleEl = document.getElementById('staleresp');
+    staleEl.textContent = d.rs485_stale_resp;
+    staleEl.className = d.rs485_stale_resp > 0 ? 'warn' : '';
     document.getElementById('reqage').textContent = age(d.rs485_req_age_ms);
     document.getElementById('txage').textContent = age(d.rs485_tx_age_ms);
     document.getElementById('rawtotal').textContent = d.raw_rx_total + ' bytes';
@@ -380,22 +444,30 @@ setInterval(update, 1000);
 }
 
 void handleData() {
-    bool     stale = !depthValid || ((millis() - lastDepthMs) > DEPTH_STALE_MS);
-    uint32_t now   = millis();
+    uint32_t now           = millis();
+    bool acquiredStale     = everHadDepth && ((now - lastDepthMs) > DEPTH_STALE_MS);
+    bool fresh             = everHadDepth && !acquiredStale;
+    // depth_state: "fresh" | "acquired_stale" | "boot_no_data"
+    const char* depthState = fresh ? "fresh" : (acquiredStale ? "acquired_stale" : "boot_no_data");
     String json = "{";
-    json += "\"firmware\":\""    + String(SW_VERSION_STRING) + "\",";
-    json += "\"build_date\":\""  + String(SW_BUILD_DATE)     + "\",";
-    json += "\"uptime_s\":"      + String(now / 1000)        + ",";
-    json += "\"can_ready\":"     + String(canReady ? "true" : "false") + ",";
-    json += "\"can_retries\":"   + String(statCanRetries)    + ",";
-    json += "\"depth_ft\":"      + String(depthTenths / 10.0f, 1) + ",";
-    json += "\"depth_valid\":"   + String(stale ? "false" : "true") + ",";
-    json += "\"depth_rx\":"      + String(statDepthRx)       + ",";
-    json += "\"depth_age_ms\":"  + String(lastDepthRxMs  ? (int32_t)(now - lastDepthRxMs)  : -1) + ",";
+    json += "\"firmware\":\""      + String(SW_VERSION_STRING) + "\",";
+    json += "\"build_date\":\""    + String(SW_BUILD_DATE)     + "\",";
+    json += "\"uptime_s\":"        + String(now / 1000)        + ",";
+    json += "\"can_ready\":"       + String(canReady ? "true" : "false") + ",";
+    json += "\"can_retries\":"     + String(statCanRetries)    + ",";
+    json += "\"depth_ft\":"        + String(depthTenths / 10.0f, 1) + ",";
+    json += "\"depth_state\":\""   + String(depthState)        + "\",";
+    json += "\"depth_valid\":"     + String(fresh ? "true" : "false") + ",";
+    json += "\"ever_had_depth\":"  + String(everHadDepth ? "true" : "false") + ",";
+    json += "\"depth_rx\":"        + String(statDepthRx)       + ",";
+    json += "\"depth_age_ms\":"    + String(lastDepthRxMs ? (int32_t)(now - lastDepthRxMs) : -1) + ",";
     json += "\"rs485_req\":"     + String(statRS485Req)      + ",";
     json += "\"rs485_req_age_ms\":" + String(lastRS485ReqMs ? (int32_t)(now - lastRS485ReqMs) : -1) + ",";
     json += "\"rs485_tx_age_ms\":"  + String(lastRS485TxMs  ? (int32_t)(now - lastRS485TxMs)  : -1) + ",";
-    json += "\"rs485_bad\":"     + String(statRS485Bad)      + ",";
+    json += "\"rs485_crc_fail\":" + String(statRS485CrcFail)  + ",";
+    json += "\"rs485_unknown\":"  + String(statRS485Unknown)   + ",";
+    json += "\"rs485_last_crc_fail_hex\":\"" + lastCrcFailHex()      + "\",";
+    json += "\"rs485_stale_resp\":" + String(statRS485StaleResp) + ",";
     json += "\"raw_rx_total\":"  + String(rawRxTotal)        + ",";
     json += "\"raw_rx_hex\":\""  + rawRxHex()                + "\"";
     json += "}";
