@@ -22,7 +22,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.10.0"
+#define SW_VERSION_STRING  "v2.11.0"
 #define SW_BUILD_DATE      "2026-07-01"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -144,26 +144,22 @@ static inline void rs485Rx() { digitalWrite(RS485_DE_RE_PIN, LOW);  }
 static void sendDepthResponse() {
     uint32_t now  = millis();
     // "acquired stale" = we had data but lost it (N2k went quiet mid-session)
-    // "boot stale"     = we never had data (engine just started, transducer out of water)
+    // "boot stale"     = we never had data yet this session
     bool acquiredStale = everHadDepth && ((now - lastDepthMs) > DEPTH_STALE_MS);
     bool fresh         = everHadDepth && !acquiredStale;
 
     // What depth value to send:
     //   fresh           → current reading from N2k
-    //   acquired stale  → last good reading (holds the display)
-    //   boot stale      → 0 (we have nothing; send 0.0 ft with live toggle so DEPTH field shows)
+    //   acquired stale  → last good reading (holds the display on dash)
+    //   boot stale      → 0.0 ft (nothing yet; show something rather than blank)
     uint16_t d = fresh ? depthTenths : lastGoodTenths;
 
-    // Toggle behaviour:
-    //   fresh           → alternate every reply  → MMDC shows solid reading
-    //   acquired stale  → freeze toggle           → MMDC blinks/blanks (data old)
-    //   boot stale      → alternate every reply  → MMDC shows 0.0 ft solid
-    //                     Rationale: at boot the transducer is out of water; the Garmin
-    //                     won't have real depth anyway.  Keeping the toggle live lets
-    //                     the DEPTH field appear on the dash immediately after key-on
-    //                     instead of staying blank until the first valid N2k packet.
-    bool freezeToggle = acquiredStale;
-    if (freezeToggle) statRS485StaleResp++;
+    // Toggle behaviour: ALWAYS ALTERNATE.
+    // We previously froze the toggle on acquired-stale, thinking the MMDC would
+    // blink or indicate "old data". In practice it just BLANKS the DEPTH field
+    // entirely. A stale-but-visible depth reading is far more useful than a blank.
+    // Use statRS485StaleResp to track when we're serving stale data for diagnostics.
+    if (!fresh) statRS485StaleResp++;
 
     uint8_t resp[RESPONSE_LEN] = {
         RESPONSE_LEN,
@@ -177,7 +173,7 @@ static void sendDepthResponse() {
         0x00
     };
     resp[12] = calcChecksum(resp, 12);
-    if (!freezeToggle) toggleBit ^= 1;
+    toggleBit ^= 1;  // always alternate — frozen toggle = MMDC blanks DEPTH entirely
     statRS485Req++;
     lastRS485TxMs = millis();
 
