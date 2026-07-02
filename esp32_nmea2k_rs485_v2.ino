@@ -11,7 +11,7 @@
  *  WiFi : Soft-AP  SSID "nmea2k_rs485_gw" / pw "123456789"
  *
  * Author : caseyn
- * Version: 2.15.0  (2026-07-02)
+ * Version: 2.15.1  (2026-07-02)
  */
 
 #include <Arduino.h>
@@ -25,7 +25,7 @@
 #include <freertos/semphr.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.15.0"
+#define SW_VERSION_STRING  "v2.15.1"
 #define SW_BUILD_DATE      "2026-07-02"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -406,8 +406,9 @@ static void drainCAN() {
 static void rs485Task(void *param) {
     for (;;) {
         handleRS485();
-        vTaskDelay(1);  // yield 1 tick (~1ms) — enough to prevent WDT and
-                        // still respond well within the MMDC's timeout window
+        vTaskDelay(1 / portTICK_PERIOD_MS);  // yield 1ms — same pattern as mefi CAN tasks.
+                                              // Prevents WDT starvation while keeping
+                                              // response latency well under MMDC timeout.
     }
 }
 
@@ -853,11 +854,12 @@ void setup() {
         "rs485Task",    // name
         4096,           // stack bytes (ample for frame parser + sender)
         nullptr,        // param
-        2,              // priority 2 > loop priority 1 — preempts loop()
+        20,             // priority 20 — matches mefi CAN reader tasks;
+                        // well above loop() (priority 1) and HTTP server
         nullptr,        // task handle (not needed)
-        1               // core 1 (same as loop; scheduler handles preemption)
+        1               // core 1 (same as loop; preempts via priority)
     );
-    Serial.println("RS485 task started on Core 1 at priority 2");
+    Serial.println("RS485 task started on Core 1 at priority 20");
     Serial.println("Setup complete.");
 }
 
