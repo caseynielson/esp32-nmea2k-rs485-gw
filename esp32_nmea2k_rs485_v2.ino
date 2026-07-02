@@ -6,12 +6,12 @@
  *
  * Hardware
  * ────────
- *  CAN  : TJA1050 — TX→GPIO5, RX→GPIO4, 250 kbps
- *  RS485: MAX485  — TX→GPIO17, RX→GPIO16, DE/RE→GPIO21, 76800 baud
+ *  CAN  : TJA1050 - TX→GPIO5, RX→GPIO4, 250 kbps
+ *  RS485: MAX485  - TX→GPIO17, RX→GPIO16, DE/RE→GPIO21, 76800 baud
  *  WiFi : Soft-AP  SSID "nmea2k_rs485_gw" / pw "123456789"
  *
  * Author : caseyn
- * Version: 2.14.0  (2026-07-02)
+ * Version: 2.15.0  (2026-07-02)
  */
 
 #include <Arduino.h>
@@ -20,9 +20,12 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.14.0"
+#define SW_VERSION_STRING  "v2.15.0"
 #define SW_BUILD_DATE      "2026-07-02"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -30,6 +33,13 @@ const char *ssid     = "nmea2k_rs485_gw";
 const char *password = "123456789";
 
 WebServer server(80);
+
+// ── FreeRTOS: RS485 task (high priority) + loop() (lower priority), both Core 1 ─────
+// Arduino loop() runs on Core 1 at priority 1. rs485Task also runs on Core 1
+// at priority 2, so it PREEMPTS loop() whenever RS485 bytes arrive.
+// HTTP/CAN work in loop() cannot block the RS485 response path.
+// The MMDC polls every ~2s; any loop() blockage >~20ms could cause a missed response.
+SemaphoreHandle_t depthMutex;  // protects shared depth state between cores
 
 // ── CAN (NMEA 2000) ───────────────────────────────────────────────────────────
 #define CAN_TX_PIN     5
@@ -49,16 +59,16 @@ HardwareSerial RS485Serial(2);
 // These are the factory defaults; changed at runtime via POST /tune.
 struct TuneParams {
     uint16_t staleMs;       // ms before depth is considered stale
-    uint16_t preTxDelayUs;  // µs DE asserted before first byte
+    uint16_t preTxDelayUs;  // μs DE asserted before first byte
     uint8_t  freshByte11;   // response byte[11] when depth is FRESH (solid display)
     uint8_t  staleByte11;   // response byte[11] when depth is STALE (blink candidate)
     bool     pingEnabled;   // whether to respond to cmd=0x06 ping frames
     bool     bootFallback;  // send 0.0ft response when no N2k depth ever received
 } tune = {
     .staleMs      = 15000,  // default: 15s stale window
-    .preTxDelayUs = 50,     // default: 50µs pre-TX delay
+    .preTxDelayUs = 50,     // default: 50μs pre-TX delay
     .freshByte11  = 0x02,   // confirmed solid display
-    .staleByte11  = 0x02,   // TEST: 0x00 may trigger blink — start same as fresh
+    .staleByte11  = 0x02,   // TEST: 0x00 may trigger blink - start same as fresh
     .pingEnabled  = false,  // DO NOT respond to cmd=0x06 by default.
                             // The MMDC does NOT open a response window after 0x06 --
                             // it immediately continues broadcasting. Responding causes
@@ -74,54 +84,58 @@ struct TuneParams {
 #define RESPONSE_LEN     13
 #define MSG_TYPE_REQUEST 0x04  // length byte value for a 4-byte depth-poll frame
 #define MSG_CMD_DEPTH    0x09
-#define MSG_CMD_PING     0x06  // 4-byte cmd=0x06 frame — appears every MMDC cycle before 0x09
+#define MSG_CMD_PING     0x06  // 4-byte cmd=0x06 frame - appears every MMDC cycle before 0x09
                            // hypothesis: responding to this refreshes the display timer
 
 // ── Depth state ───────────────────────────────────────────────────────────────
 // stale threshold is now runtime-tunable via tune.staleMs
 #define DEPTH_STALE_MS_DEFAULT 15000
 
-static uint16_t depthTenths    = 0;  // current depth in tenths of a foot
-static uint16_t lastGoodTenths = 0;  // last valid depth, held when stale
-static bool     depthValid     = false;
-static bool     everHadDepth   = false; // true once we've received at least one valid N2k frame
-static uint32_t lastDepthMs    = 0;
-static uint8_t  toggleBit      = 0;
+// Shared between Core 0 (CAN/N2k writer) and Core 1 (RS485 reader).
+// All reads/writes in handleDepth() and sendDepthResponse() must hold depthMutex.
+static volatile uint16_t depthTenths    = 0;  // current depth in tenths of a foot
+static volatile uint16_t lastGoodTenths = 0;  // last valid depth, held when stale
+static volatile bool     depthValid     = false;
+static volatile bool     everHadDepth   = false;
+static volatile uint32_t lastDepthMs    = 0;
+static volatile uint8_t  toggleBit      = 0;
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
-static uint32_t statDepthRx      = 0;
-static uint32_t statRS485Req       = 0;  // depth poll (cmd=0x09) responses sent
-static uint32_t statRS485PingResp  = 0;  // cmd=0x06 ping responses sent
-static uint32_t statRS485CrcFail   = 0;  // true checksum failures (wire noise / framing)
-static uint32_t statRS485Unknown   = 0;  // valid frame, unrecognised command type
-static uint32_t statRS485StaleResp = 0;  // responses sent with stale/no N2k data
-static uint32_t lastDepthRxMs      = 0;
-static uint32_t lastRS485ReqMs     = 0;
-static uint32_t lastRS485PingMs    = 0;
-static uint32_t lastRS485TxMs      = 0;
-static uint8_t  lastCrcFailBuf[4]  = {0, 0, 0, 0};  // last 4-byte frame that failed CRC (debug)
+// Stats shared between cores — written by Core 1 (RS485 task), read by Core 0 (HTTP).
+// Use volatile; occasional torn reads on HTTP display are acceptable.
+static volatile uint32_t statDepthRx      = 0;
+static volatile uint32_t statRS485Req       = 0;
+static volatile uint32_t statRS485PingResp  = 0;
+static volatile uint32_t statRS485CrcFail   = 0;
+static volatile uint32_t statRS485Unknown   = 0;
+static volatile uint32_t statRS485StaleResp = 0;
+static volatile uint32_t lastDepthRxMs      = 0;
+static volatile uint32_t lastRS485ReqMs     = 0;
+static volatile uint32_t lastRS485PingMs    = 0;
+static volatile uint32_t lastRS485TxMs      = 0;
+static uint8_t  lastCrcFailBuf[4]  = {0, 0, 0, 0};
 
 // ── Poll interval tracking ─────────────────────────────────────────────────────
 // Measures actual MMDC depth-poll (cmd=0x09) inter-arrival time.
 // Helps diagnose display-timer vs poll-rate mismatches.
-static uint32_t pollIntervalMin  = 0xFFFFFFFF;  // ms, reset to 0xFFFFFFFF at boot
-static uint32_t pollIntervalMax  = 0;
-static uint32_t pollIntervalSum  = 0;           // for running average
-static uint32_t pollIntervalCnt  = 0;
-static uint32_t lastPollArrivalMs = 0;
+static volatile uint32_t pollIntervalMin  = 0xFFFFFFFF;
+static volatile uint32_t pollIntervalMax  = 0;
+static volatile uint32_t pollIntervalSum  = 0;
+static volatile uint32_t pollIntervalCnt  = 0;
+static volatile uint32_t lastPollArrivalMs = 0;
 
 // ── CAN state ─────────────────────────────────────────────────────────────────
 static bool     canReady       = false;
 static uint32_t lastCanRetryMs = 0;
 static uint32_t statCanRetries = 0;
 
-// ── Raw RS485 RX sniffer — ring buffer of last 128 bytes seen on the bus ──────
+// ── Raw RS485 RX sniffer - ring buffer of last 128 bytes seen on the bus ──────
 // Every byte received from RS485 (before framing/checksum) is captured here so
 // we can inspect exactly what the MMDC is sending via the /status page.
 #define RAW_RX_BUF_LEN 256  // 256 bytes captures ~20 full MMDC cycles for better visibility
 static uint8_t  rawRxBuf[RAW_RX_BUF_LEN];
-static uint16_t rawRxHead  = 0;   // next write slot (wraps)
-static uint32_t rawRxTotal = 0;   // total bytes ever captured
+static uint16_t rawRxHead  = 0;
+static volatile uint32_t rawRxTotal = 0;
 
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -181,19 +195,31 @@ static inline void rs485Rx() { digitalWrite(RS485_DE_RE_PIN, LOW);  }
 // Used for both cmd=0x09 (depth poll) and cmd=0x06 (ping/keepalive).
 static void sendDepthResponse() {
     uint32_t now  = millis();
-    // "acquired stale" = we had data but lost it (N2k went quiet mid-session)
-    // "boot stale"     = we never had data yet this session
-    bool acquiredStale = everHadDepth && ((now - lastDepthMs) > (uint32_t)tune.staleMs);
-    bool fresh         = everHadDepth && !acquiredStale;
-    bool bootNoData    = !everHadDepth;
+    // Read shared depth state under mutex (Core 0 writes via handleDepth)
+    uint16_t localDepthTenths, localLastGoodTenths;
+    bool localEverHad;
+    uint32_t localLastDepthMs;
+    if (xSemaphoreTake(depthMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+        localDepthTenths    = depthTenths;
+        localLastGoodTenths = lastGoodTenths;
+        localEverHad        = everHadDepth;
+        localLastDepthMs    = lastDepthMs;
+        xSemaphoreGive(depthMutex);
+    } else {
+        // Couldn't get mutex in 2ms — use last known values, skip this response
+        return;
+    }
+    bool acquiredStale = localEverHad && ((now - localLastDepthMs) > (uint32_t)tune.staleMs);
+    bool fresh         = localEverHad && !acquiredStale;
+    bool bootNoData    = !localEverHad;
 
     // What depth value to send:
     //   fresh           → current reading from N2k
     //   acquired stale  → last good reading (hold last known depth on display)
     //   boot stale      → 0.0 ft if bootFallback enabled, else suppress
-    uint16_t d = fresh ? depthTenths : lastGoodTenths;
+    uint16_t d = fresh ? localDepthTenths : localLastGoodTenths;
     if (bootNoData && !tune.bootFallback) {
-        // boot_no_data with fallback disabled — don't respond, let MMDC blank
+        // boot_no_data with fallback disabled - don't respond, let MMDC blank
         statRS485Req++;
         lastRS485TxMs = millis();
         return;
@@ -218,8 +244,8 @@ static void sendDepthResponse() {
         0x00
     };
     resp[12] = calcChecksum(resp, 12);
-    toggleBit ^= 1;  // always alternate — frozen toggle = MMDC blanks DEPTH entirely
-    statRS485Req++;  // caller may override — see sendPingResponse()
+    toggleBit ^= 1;  // always alternate - frozen toggle = MMDC blanks DEPTH entirely
+    statRS485Req++;  // caller may override - see sendPingResponse()
     lastRS485TxMs = millis();
 
     rs485Tx();
@@ -227,7 +253,7 @@ static void sendDepthResponse() {
     RS485Serial.write(resp, RESPONSE_LEN);
     RS485Serial.flush();       // wait for TX buffer to drain into UART shift register
     delayMicroseconds(300);    // wait for the last byte's stop bit to fully clock out
-                                // (76800 baud → 1 byte ≈ 130 µs; 300 µs gives full margin)
+                                // (76800 baud → 1 byte ≈ 130 μs; 300 μs gives full margin)
     rs485Rx();
 }
 
@@ -239,11 +265,11 @@ static void sendPingResponse() {
     statRS485PingResp++;   // always count observed ping frames
     lastRS485PingMs = millis();
     if (!tune.pingEnabled) {
-        // ping response disabled (default) — MMDC gives no response window after 0x06
+        // ping response disabled (default) - MMDC gives no response window after 0x06
         // responding would cause RS485 collision with MMDC's next broadcast frame
         return;
     }
-    // Reuse sendDepthResponse() for the frame — it already handles stale/fresh
+    // Reuse sendDepthResponse() for the frame - it already handles stale/fresh
     // depth and always alternates the toggle.
     // Undo the statRS485Req++ it adds (ping has its own counter).
     sendDepthResponse();
@@ -262,7 +288,7 @@ static void handleRS485() {
 
         if (idx == 0) {
             // First byte is the MMDC frame length (total bytes incl. length + checksum).
-            // Accept 4–FRAME_MAX_LEN; anything outside that range is skipped.
+            // Accept 4-FRAME_MAX_LEN; anything outside that range is skipped.
             // Using FRAME_MAX_LEN (not 4) is critical: the MMDC sends 5-, 8-, 12-,
             // and 13-byte status broadcasts that contain 0x04 as a *data* byte.
             // When we only accepted length=4, those 0x04 data bytes were mistaken
@@ -274,12 +300,12 @@ static void handleRS485() {
         buf[idx++] = b;
         if (idx < expected) continue;
 
-        // Full frame received — verify checksum then dispatch.
+        // Full frame received - verify checksum then dispatch.
         if (!verifyChecksum(buf, expected)) {
             memcpy(lastCrcFailBuf, buf, 4);  // capture first 4 bytes for /status debug
             statRS485CrcFail++;              // genuine wire error on a known-length frame
         } else if (buf[0] == MSG_TYPE_REQUEST && buf[1] == MSG_CMD_DEPTH) {
-            // 4-byte depth poll (cmd=0x09) from MMDC — reply with current depth.
+            // 4-byte depth poll (cmd=0x09) from MMDC - reply with current depth.
             // Track inter-poll interval for display-timer diagnosis.
             uint32_t now = millis();
             if (lastPollArrivalMs > 0) {
@@ -293,14 +319,14 @@ static void handleRS485() {
             lastRS485ReqMs    = now;
             sendDepthResponse();
         } else if (buf[0] == MSG_TYPE_REQUEST && buf[1] == MSG_CMD_PING) {
-            // 4-byte cmd=0x06 frame — appears each MMDC cycle before the depth poll.
+            // 4-byte cmd=0x06 frame - appears each MMDC cycle before the depth poll.
             // IMPORTANT: The MMDC does NOT open a response window after this frame.
             // It immediately resumes broadcasting on the shared RS485 bus.
             // Responding causes collisions that corrupt our 0x09 depth response.
             // Only respond if explicitly enabled via /tune (for experimental testing).
             sendPingResponse();
         } else {
-            // Valid frame, not a recognised command — MMDC status broadcast, ignore.
+            // Valid frame, not a recognised command - MMDC status broadcast, ignore.
             statRS485Unknown++;
         }
         idx = expected = 0;
@@ -322,25 +348,23 @@ static uint32_t extractPGN(uint32_t id) {
 
 static void handleDepth(const CanFrame &f) {
     if (f.data_length_code < 7) return;
-    // PGN 128267 depth field is 32-bit (bytes 1–4), resolution 0.01 m.
-    // Reading only 3 bytes missed the MSB and let N2K error/not-available
-    // codes (0xFFFFFFFF, etc.) pass the sanity check as huge valid depths.
-    // Those bogus values were stored in lastGoodTenths, then sent as signed
-    // 16-bit overflow (e.g. 0xFD50 = −688) which the MMDC clamps to 0 and blinks.
     uint32_t rawM = (uint32_t)f.data[1] | ((uint32_t)f.data[2] << 8) |
                     ((uint32_t)f.data[3] << 16) | ((uint32_t)f.data[4] << 24);
-    // Reject N2K “not available” (0xFFFFFFFF / 0xFFFFFFFE) and anything
-    // deeper than 300 m (30 000 raw units ≈ 984 ft) — clearly out of water.
     if (rawM > 30000) return;
     float depthM  = rawM * 0.01f;
     float depthFt = depthM * 3.28084f;
-    depthTenths    = (uint16_t)(depthFt * 10.0f + 0.5f);
-    lastGoodTenths = depthTenths;
-    depthValid     = true;
-    everHadDepth   = true;
-    lastDepthMs    = millis();
-    lastDepthRxMs  = millis();
-    statDepthRx++;
+    uint16_t tenths = (uint16_t)(depthFt * 10.0f + 0.5f);
+    // Take mutex: Core 1 RS485 task reads these fields during sendDepthResponse()
+    if (xSemaphoreTake(depthMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+        depthTenths    = tenths;
+        lastGoodTenths = tenths;
+        depthValid     = true;
+        everHadDepth   = true;
+        lastDepthMs    = millis();
+        lastDepthRxMs  = millis();
+        statDepthRx++;
+        xSemaphoreGive(depthMutex);
+    }
 }
 
 // Retry CAN init every CAN_RETRY_MS if it failed at boot.
@@ -356,14 +380,14 @@ static void maybeRetryCAN() {
         Serial.printf("CAN init OK on retry #%lu\n", statCanRetries);
         canReady = true;
     } else {
-        Serial.printf("CAN retry #%lu failed — will retry in %ds\n",
+        Serial.printf("CAN retry #%lu failed - will retry in %ds\n",
                       statCanRetries, CAN_RETRY_MS / 1000);
     }
 }
 
 static void drainCAN() {
     if (!canReady) return;
-    // Drain up to 8 frames per call — avoids TWAI FIFO overflow when
+    // Drain up to 8 frames per call - avoids TWAI FIFO overflow when
     // the loop stalls briefly on RS485/HTTP, without the unbounded while
     // that caused hangs with large RX queues in the ESP32-TWAI-CAN library.
     for (uint8_t i = 0; i < 8; i++) {
@@ -373,6 +397,19 @@ static void drainCAN() {
     }
 }
 
+
+// ── RS485 FreeRTOS task (Core 1) ─────────────────────────────────────────────
+// Runs handleRS485() in a tight loop on Core 1 with a short yield between
+// iterations. This completely decouples RS485 response latency from HTTP/CAN
+// work on Core 0. The MMDC gets a response within ~1ms of its poll regardless
+// of what the web server or CAN handler is doing.
+static void rs485Task(void *param) {
+    for (;;) {
+        handleRS485();
+        vTaskDelay(1);  // yield 1 tick (~1ms) — enough to prevent WDT and
+                        // still respond well within the MMDC's timeout window
+    }
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Web server
@@ -452,7 +489,7 @@ void handleTuneGet() {
 <body>
 <div class='card'>
   <h2>🔧 Tuning Parameters</h2>
-  <div class='banner' id='ok'>✓ Parameters applied — no reboot needed.</div>
+  <div class='banner' id='ok'>✓ Parameters applied - no reboot needed.</div>
   <form method='POST' action='/tune'>
 
     <label>Stale threshold (ms)
@@ -462,14 +499,14 @@ void handleTuneGet() {
     </label>
     <div class='hint'>How long after last N2k depth frame before we consider it stale. Default: 15000 ms.</div>
 
-    <label>Pre-TX delay (µs)
+    <label>Pre-TX delay (μs)
       <input type='number' name='preTxUs' min='10' max='1000' step='10' value=')rawliteral";
     html += String(tune.preTxDelayUs);
     html += R"rawliteral('>
     </label>
-    <div class='hint'>DE assert to first byte gap. 50µs works; increase if TX collisions suspected.</div>
+    <div class='hint'>DE assert to first byte gap. 50μs works; increase if TX collisions suspected.</div>
 
-    <label>byte[11] — FRESH depth (0x02 = solid, 0x00 = blink)
+    <label>byte[11] - FRESH depth (0x02 = solid, 0x00 = blink)
       <select name='freshByte11'>
         <option value='0' )rawliteral";
     html += (tune.freshByte11 == 0x00) ? "selected" : "";
@@ -481,11 +518,11 @@ void handleTuneGet() {
     </label>
     <div class='hint'>Controls MMDC display mode when N2k data is current. Normally 0x02 (solid).</div>
 
-    <label>byte[11] — STALE/BOOT depth (hypothesis: 0x00 = blink)
+    <label>byte[11] - STALE/BOOT depth (hypothesis: 0x00 = blink)
       <select name='staleByte11'>
         <option value='0' )rawliteral";
     html += (tune.staleByte11 == 0x00) ? "selected" : "";
-    html += R"rawliteral(>0x00 (blink — test this!)</option>
+    html += R"rawliteral(>0x00 (blink - test this!)</option>
         <option value='2' )rawliteral";
     html += (tune.staleByte11 == 0x02) ? "selected" : "";
     html += R"rawliteral(>0x02 (solid)</option>
@@ -519,7 +556,7 @@ void handleTuneGet() {
 
     <input type='submit' value='Apply (no reboot)'>
   </form>
-  <div class='note'>⚠ Changes are RAM-only — lost on reboot. Flash a new firmware to make permanent.</div>
+  <div class='note'>⚠ Changes are RAM-only - lost on reboot. Flash a new firmware to make permanent.</div>
   <div class='links'><a href='/status'>Status</a> <a href='/'>OTA Update</a></div>
 </div>
 <script>
@@ -661,7 +698,7 @@ function update(){
     document.getElementById('pingage').textContent = age(d.rs485_ping_age_ms);
     document.getElementById('txage').textContent = age(d.rs485_tx_age_ms);
     document.getElementById('tstale').textContent = d.tune_stale_ms + ' ms';
-    document.getElementById('tpretx').textContent = d.tune_pre_tx_us + ' µs';
+    document.getElementById('tpretx').textContent = d.tune_pre_tx_us + ' μs';
     document.getElementById('tb11').textContent =
       '0x' + d.tune_fresh_b11.toString(16).padStart(2,'0') + ' / 0x' + d.tune_stale_b11.toString(16).padStart(2,'0');
     document.getElementById('tping').textContent = d.tune_ping_enabled ? 'yes' : 'no';
@@ -685,9 +722,22 @@ setInterval(update, 1000);
 
 void handleData() {
     uint32_t now           = millis();
-    bool acquiredStale     = everHadDepth && ((now - lastDepthMs) > (uint32_t)tune.staleMs);
-    bool fresh             = everHadDepth && !acquiredStale;
-    // depth_state: "fresh" | "acquired_stale" | "boot_no_data"
+    // Read shared state snapshot for HTTP response (Core 1 writes these)
+    bool localEverHad_h;
+    uint32_t localLastDepthMs_h;
+    uint16_t localDepthTenths_h;
+    if (xSemaphoreTake(depthMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        localEverHad_h      = everHadDepth;
+        localLastDepthMs_h  = lastDepthMs;
+        localDepthTenths_h  = depthTenths;
+        xSemaphoreGive(depthMutex);
+    } else {
+        localEverHad_h      = false;
+        localLastDepthMs_h  = 0;
+        localDepthTenths_h  = 0;
+    }
+    bool acquiredStale     = localEverHad_h && ((now - localLastDepthMs_h) > (uint32_t)tune.staleMs);
+    bool fresh             = localEverHad_h && !acquiredStale;
     const char* depthState = fresh ? "fresh" : (acquiredStale ? "acquired_stale" : "boot_no_data");
     String json = "{";
     json += "\"firmware\":\""      + String(SW_VERSION_STRING) + "\",";
@@ -695,12 +745,12 @@ void handleData() {
     json += "\"uptime_s\":"        + String(now / 1000)        + ",";
     json += "\"can_ready\":"       + String(canReady ? "true" : "false") + ",";
     json += "\"can_retries\":"     + String(statCanRetries)    + ",";
-    json += "\"depth_ft\":"        + String(depthTenths / 10.0f, 1) + ",";
+    json += "\"depth_ft\":"        + String(localDepthTenths_h / 10.0f, 1) + ",";
     json += "\"depth_state\":\""   + String(depthState)        + "\",";
     json += "\"depth_valid\":"     + String(fresh ? "true" : "false") + ",";
-    json += "\"ever_had_depth\":"  + String(everHadDepth ? "true" : "false") + ",";
+    json += "\"ever_had_depth\":"  + String(localEverHad_h ? "true" : "false") + ",";
     json += "\"depth_rx\":"        + String(statDepthRx)       + ",";
-    json += "\"depth_age_ms\":"    + String(lastDepthRxMs ? (int32_t)(now - lastDepthRxMs) : -1) + ",";
+    json += "\"depth_age_ms\":"    + String(lastDepthRxMs ? (int32_t)(now - (uint32_t)lastDepthRxMs) : -1) + ",";
     json += "\"rs485_req\":"          + String(statRS485Req)       + ",";
     json += "\"rs485_ping_resp\":"     + String(statRS485PingResp)  + ",";
     json += "\"rs485_req_age_ms\":"    + String(lastRS485ReqMs  ? (int32_t)(now - lastRS485ReqMs)  : -1) + ",";
@@ -776,8 +826,6 @@ void setup() {
     Serial.println("HTTP server started");
 
     // CAN — non-fatal at boot; retried every CAN_RETRY_MS in loop()
-    // NMEA 2000 networks sometimes need a few seconds to stabilise after
-    // power-on, so begin() may fail even when hardware is physically fine.
     ESP32Can.setPins(CAN_TX_PIN, CAN_RX_PIN);
     if (!ESP32Can.begin(ESP32Can.convertSpeed(CAN_SPEED_KBPS))) {
         Serial.printf("WARNING: CAN init failed — will retry every %ds\n",
@@ -788,6 +836,28 @@ void setup() {
         canReady = true;
     }
 
+    // Create mutex for shared depth state between cores
+    depthMutex = xSemaphoreCreateMutex();
+    if (!depthMutex) {
+        Serial.println("ERROR: failed to create depthMutex — halting");
+        while (1) delay(1000);
+    }
+
+    // Spawn RS485 task on Core 1 at priority 2.
+    // Arduino loop() runs on Core 1 at priority 1, so rs485Task preempts it
+    // whenever UART data arrives — HTTP serving cannot delay RS485 responses.
+    // RS485Serial is initialised above in setup() and accessed ONLY by rs485Task
+    // after this point; no concurrent UART access from loop().
+    xTaskCreatePinnedToCore(
+        rs485Task,      // task function
+        "rs485Task",    // name
+        4096,           // stack bytes (ample for frame parser + sender)
+        nullptr,        // param
+        2,              // priority 2 > loop priority 1 — preempts loop()
+        nullptr,        // task handle (not needed)
+        1               // core 1 (same as loop; scheduler handles preemption)
+    );
+    Serial.println("RS485 task started on Core 1 at priority 2");
     Serial.println("Setup complete.");
 }
 
@@ -797,8 +867,9 @@ void setup() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 void loop() {
-    handleRS485();    // first, always — UART HW buffer holds bytes safely
-    maybeRetryCAN();  // no-op when canReady; retries CAN init every 5 s if needed
+    // RS485 is now handled by rs485Task on Core 1 — do NOT call handleRS485() here.
+    // loop() handles CAN, HTTP, and CAN retry only.
+    maybeRetryCAN();
     drainCAN();
     server.handleClient();
 }
