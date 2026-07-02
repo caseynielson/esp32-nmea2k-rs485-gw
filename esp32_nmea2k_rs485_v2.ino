@@ -11,7 +11,7 @@
  *  WiFi : Soft-AP  SSID "nmea2k_rs485_gw" / pw "123456789"
  *
  * Author : caseyn
- * Version: 2.13.0  (2026-07-02)
+ * Version: 2.14.0  (2026-07-02)
  */
 
 #include <Arduino.h>
@@ -22,7 +22,7 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.13.0"
+#define SW_VERSION_STRING  "v2.14.0"
 #define SW_BUILD_DATE      "2026-07-02"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -59,7 +59,11 @@ struct TuneParams {
     .preTxDelayUs = 50,     // default: 50µs pre-TX delay
     .freshByte11  = 0x02,   // confirmed solid display
     .staleByte11  = 0x02,   // TEST: 0x00 may trigger blink — start same as fresh
-    .pingEnabled  = true,   // respond to cmd=0x06
+    .pingEnabled  = false,  // DO NOT respond to cmd=0x06 by default.
+                            // The MMDC does NOT open a response window after 0x06 --
+                            // it immediately continues broadcasting. Responding causes
+                            // RS485 collisions that corrupt our real 0x09 response.
+                            // Enable only for testing via /tune.
     .bootFallback = true,   // send 0.0ft when no depth yet
 };
 
@@ -114,9 +118,9 @@ static uint32_t statCanRetries = 0;
 // ── Raw RS485 RX sniffer — ring buffer of last 128 bytes seen on the bus ──────
 // Every byte received from RS485 (before framing/checksum) is captured here so
 // we can inspect exactly what the MMDC is sending via the /status page.
-#define RAW_RX_BUF_LEN 128  // 128 bytes captures ~10 full 12-byte MMDC cycles
+#define RAW_RX_BUF_LEN 256  // 256 bytes captures ~20 full MMDC cycles for better visibility
 static uint8_t  rawRxBuf[RAW_RX_BUF_LEN];
-static uint8_t  rawRxHead  = 0;   // next write slot (wraps)
+static uint16_t rawRxHead  = 0;   // next write slot (wraps)
 static uint32_t rawRxTotal = 0;   // total bytes ever captured
 
 
@@ -232,10 +236,11 @@ static void sendDepthResponse() {
 // Hypothesis: responding to it refreshes the MMDC display timer so depth
 // stays visible between the slower (~2s) depth polls.
 static void sendPingResponse() {
+    statRS485PingResp++;   // always count observed ping frames
+    lastRS485PingMs = millis();
     if (!tune.pingEnabled) {
-        // ping response disabled via /tune — skip silently
-        statRS485PingResp++;
-        lastRS485PingMs = millis();
+        // ping response disabled (default) — MMDC gives no response window after 0x06
+        // responding would cause RS485 collision with MMDC's next broadcast frame
         return;
     }
     // Reuse sendDepthResponse() for the frame — it already handles stale/fresh
@@ -243,8 +248,7 @@ static void sendPingResponse() {
     // Undo the statRS485Req++ it adds (ping has its own counter).
     sendDepthResponse();
     statRS485Req--;        // un-count from depth-poll stat
-    statRS485PingResp++;   // count as ping instead
-    lastRS485PingMs = millis();
+    // statRS485PingResp already incremented above; lastRS485PingMs already set
 }
 
 static void handleRS485() {
@@ -290,7 +294,10 @@ static void handleRS485() {
             sendDepthResponse();
         } else if (buf[0] == MSG_TYPE_REQUEST && buf[1] == MSG_CMD_PING) {
             // 4-byte cmd=0x06 frame — appears each MMDC cycle before the depth poll.
-            // Respond with our depth frame to try to keep the display timer alive.
+            // IMPORTANT: The MMDC does NOT open a response window after this frame.
+            // It immediately resumes broadcasting on the shared RS485 bus.
+            // Responding causes collisions that corrupt our 0x09 depth response.
+            // Only respond if explicitly enabled via /tune (for experimental testing).
             sendPingResponse();
         } else {
             // Valid frame, not a recognised command — MMDC status broadcast, ignore.
