@@ -11,7 +11,7 @@
  *  WiFi : Soft-AP  SSID "nmea2k_rs485_gw" / pw "123456789"
  *
  * Author : caseyn
- * Version: 2.6.0  (2026-06-28)
+ * Version: 2.13.0  (2026-07-02)
  */
 
 #include <Arduino.h>
@@ -22,8 +22,8 @@
 #include <Update.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.12.0"
-#define SW_BUILD_DATE      "2026-07-01"
+#define SW_VERSION_STRING  "v2.13.0"
+#define SW_BUILD_DATE      "2026-07-02"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
 const char *ssid     = "nmea2k_rs485_gw";
@@ -45,6 +45,24 @@ WebServer server(80);
 
 HardwareSerial RS485Serial(2);
 
+// ── Runtime-tunable parameters (adjustable via /tune without reflashing) ────────
+// These are the factory defaults; changed at runtime via POST /tune.
+struct TuneParams {
+    uint16_t staleMs;       // ms before depth is considered stale
+    uint16_t preTxDelayUs;  // µs DE asserted before first byte
+    uint8_t  freshByte11;   // response byte[11] when depth is FRESH (solid display)
+    uint8_t  staleByte11;   // response byte[11] when depth is STALE (blink candidate)
+    bool     pingEnabled;   // whether to respond to cmd=0x06 ping frames
+    bool     bootFallback;  // send 0.0ft response when no N2k depth ever received
+} tune = {
+    .staleMs      = 15000,  // default: 15s stale window
+    .preTxDelayUs = 50,     // default: 50µs pre-TX delay
+    .freshByte11  = 0x02,   // confirmed solid display
+    .staleByte11  = 0x02,   // TEST: 0x00 may trigger blink — start same as fresh
+    .pingEnabled  = true,   // respond to cmd=0x06
+    .bootFallback = true,   // send 0.0ft when no depth yet
+};
+
 // ── RS485 protocol ────────────────────────────────────────────────────────────
 #define FRAME_MAX_LEN    32   // largest MMDC frame we'll accept
                           // observed: 19-byte display frames (Temp/Oil/Fuel) when engine running
@@ -56,7 +74,8 @@ HardwareSerial RS485Serial(2);
                            // hypothesis: responding to this refreshes the display timer
 
 // ── Depth state ───────────────────────────────────────────────────────────────
-#define DEPTH_STALE_MS   15000  // 5 s was too tight; transducer/TWAI gaps up to ~10 s are normal
+// stale threshold is now runtime-tunable via tune.staleMs
+#define DEPTH_STALE_MS_DEFAULT 15000
 
 static uint16_t depthTenths    = 0;  // current depth in tenths of a foot
 static uint16_t lastGoodTenths = 0;  // last valid depth, held when stale
@@ -160,20 +179,27 @@ static void sendDepthResponse() {
     uint32_t now  = millis();
     // "acquired stale" = we had data but lost it (N2k went quiet mid-session)
     // "boot stale"     = we never had data yet this session
-    bool acquiredStale = everHadDepth && ((now - lastDepthMs) > DEPTH_STALE_MS);
+    bool acquiredStale = everHadDepth && ((now - lastDepthMs) > (uint32_t)tune.staleMs);
     bool fresh         = everHadDepth && !acquiredStale;
+    bool bootNoData    = !everHadDepth;
 
     // What depth value to send:
     //   fresh           → current reading from N2k
-    //   acquired stale  → last good reading (holds the display on dash)
-    //   boot stale      → 0.0 ft (nothing yet; show something rather than blank)
+    //   acquired stale  → last good reading (hold last known depth on display)
+    //   boot stale      → 0.0 ft if bootFallback enabled, else suppress
     uint16_t d = fresh ? depthTenths : lastGoodTenths;
+    if (bootNoData && !tune.bootFallback) {
+        // boot_no_data with fallback disabled — don't respond, let MMDC blank
+        statRS485Req++;
+        lastRS485TxMs = millis();
+        return;
+    }
 
-    // Toggle behaviour: ALWAYS ALTERNATE.
-    // We previously froze the toggle on acquired-stale, thinking the MMDC would
-    // blink or indicate "old data". In practice it just BLANKS the DEPTH field
-    // entirely. A stale-but-visible depth reading is far more useful than a blank.
-    // Use statRS485StaleResp to track when we're serving stale data for diagnostics.
+    // byte[11] controls display mode.
+    // Hypothesis: 0x02 = solid, 0x00 = blink (invalid depth indicator)
+    // tuneable per state to test without reflashing.
+    uint8_t b11 = fresh ? tune.freshByte11 : tune.staleByte11;
+
     if (!fresh) statRS485StaleResp++;
 
     uint8_t resp[RESPONSE_LEN] = {
@@ -184,7 +210,7 @@ static void sendDepthResponse() {
         0xFF, 0x03,
         0xFF, 0x03,
         toggleBit,
-        0x02,
+        b11,
         0x00
     };
     resp[12] = calcChecksum(resp, 12);
@@ -193,12 +219,7 @@ static void sendDepthResponse() {
     lastRS485TxMs = millis();
 
     rs485Tx();
-    delayMicroseconds(50);     // was 200 µs — reduced to respond within MMDC's RX window.
-                                // MAX485 DE propagation <1 µs; 50 µs is plenty to settle.
-                                // 200 µs was causing the response to arrive after the MMDC
-                                // had already timed out and resumed broadcasting, which caused
-                                // collision: toggle advanced on ESP32 but MMDC never saw it,
-                                // making every other response appear frozen → "No Response".
+    delayMicroseconds(tune.preTxDelayUs);
     RS485Serial.write(resp, RESPONSE_LEN);
     RS485Serial.flush();       // wait for TX buffer to drain into UART shift register
     delayMicroseconds(300);    // wait for the last byte's stop bit to fully clock out
@@ -211,6 +232,12 @@ static void sendDepthResponse() {
 // Hypothesis: responding to it refreshes the MMDC display timer so depth
 // stays visible between the slower (~2s) depth polls.
 static void sendPingResponse() {
+    if (!tune.pingEnabled) {
+        // ping response disabled via /tune — skip silently
+        statRS485PingResp++;
+        lastRS485PingMs = millis();
+        return;
+    }
     // Reuse sendDepthResponse() for the frame — it already handles stale/fresh
     // depth and always alternates the toggle.
     // Undo the statRS485Req++ it adds (ping has its own counter).
@@ -388,6 +415,152 @@ const char *update_success_html = R"rawliteral(
 </html>
 )rawliteral";
 
+// ── /tune endpoint ───────────────────────────────────────────────────────────
+
+void handleTuneGet() {
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Tune - NMEA2k RS485 Gateway</title>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <style>
+    body{background:#181a1b;color:#f1f1f1;font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
+    .card{background:#23272a;border-radius:12px;padding:2em 2.5em;box-shadow:0 2px 16px #000a;min-width:340px;max-width:480px;width:100%;}
+    h2{color:#90caf9;margin-top:0;}
+    label{display:block;color:#90caf9;margin-top:1.1em;font-size:0.92em;}
+    .hint{color:#888;font-size:0.82em;margin-top:2px;}
+    input[type=number],input[type=text]{background:#181a1b;border:1px solid #444;border-radius:6px;color:#f1f1f1;padding:0.4em 0.7em;width:100%;box-sizing:border-box;font-size:1em;margin-top:4px;}
+    .row{display:flex;gap:1em;align-items:center;margin-top:1em;}
+    .row label{margin-top:0;flex:1;}
+    select{background:#181a1b;border:1px solid #444;border-radius:6px;color:#f1f1f1;padding:0.4em 0.7em;font-size:1em;width:100%;margin-top:4px;}
+    input[type=submit]{background:#1976d2;color:#f1f1f1;padding:0.7em 2em;border:none;border-radius:6px;font-size:1em;cursor:pointer;margin-top:1.5em;width:100%;}
+    input[type=submit]:hover{background:#1565c0;}
+    .note{color:#ffcc80;font-size:0.83em;margin-top:1.2em;}
+    .links{margin-top:1.4em;display:flex;gap:1.5em;}
+    .links a{color:#90caf9;}
+    .banner{background:#1b3a1b;border:1px solid #388e3c;border-radius:8px;padding:0.7em 1em;color:#b0f2bc;font-size:0.88em;margin-bottom:1em;display:none;}
+  </style>
+</head>
+<body>
+<div class='card'>
+  <h2>🔧 Tuning Parameters</h2>
+  <div class='banner' id='ok'>✓ Parameters applied — no reboot needed.</div>
+  <form method='POST' action='/tune'>
+
+    <label>Stale threshold (ms)
+      <input type='number' name='staleMs' min='1000' max='60000' step='500' value=')rawliteral";
+    html += String(tune.staleMs);
+    html += R"rawliteral('>
+    </label>
+    <div class='hint'>How long after last N2k depth frame before we consider it stale. Default: 15000 ms.</div>
+
+    <label>Pre-TX delay (µs)
+      <input type='number' name='preTxUs' min='10' max='1000' step='10' value=')rawliteral";
+    html += String(tune.preTxDelayUs);
+    html += R"rawliteral('>
+    </label>
+    <div class='hint'>DE assert to first byte gap. 50µs works; increase if TX collisions suspected.</div>
+
+    <label>byte[11] — FRESH depth (0x02 = solid, 0x00 = blink)
+      <select name='freshByte11'>
+        <option value='0' )rawliteral";
+    html += (tune.freshByte11 == 0x00) ? "selected" : "";
+    html += R"rawliteral(>0x00 (blink)</option>
+        <option value='2' )rawliteral";
+    html += (tune.freshByte11 == 0x02) ? "selected" : "";
+    html += R"rawliteral(>0x02 (solid)</option>
+      </select>
+    </label>
+    <div class='hint'>Controls MMDC display mode when N2k data is current. Normally 0x02 (solid).</div>
+
+    <label>byte[11] — STALE/BOOT depth (hypothesis: 0x00 = blink)
+      <select name='staleByte11'>
+        <option value='0' )rawliteral";
+    html += (tune.staleByte11 == 0x00) ? "selected" : "";
+    html += R"rawliteral(>0x00 (blink — test this!)</option>
+        <option value='2' )rawliteral";
+    html += (tune.staleByte11 == 0x02) ? "selected" : "";
+    html += R"rawliteral(>0x02 (solid)</option>
+      </select>
+    </label>
+    <div class='hint'>byte[11] sent when depth is stale or no N2k data. Try 0x00 to test if MMDC blinks.</div>
+
+    <label>Respond to cmd=0x06 ping frames?
+      <select name='pingEnabled'>
+        <option value='1' )rawliteral";
+    html += tune.pingEnabled ? "selected" : "";
+    html += R"rawliteral(>Yes (recommended)</option>
+        <option value='0' )rawliteral";
+    html += !tune.pingEnabled ? "selected" : "";
+    html += R"rawliteral(>No (depth poll only)</option>
+      </select>
+    </label>
+    <div class='hint'>Sending a depth frame on each 0x06 ping may keep display timer alive between polls.</div>
+
+    <label>Boot fallback (no N2k data yet)
+      <select name='bootFallback'>
+        <option value='1' )rawliteral";
+    html += tune.bootFallback ? "selected" : "";
+    html += R"rawliteral(>Send 0.0 ft (show something)</option>
+        <option value='0' )rawliteral";
+    html += !tune.bootFallback ? "selected" : "";
+    html += R"rawliteral(>Suppress response (let MMDC blank)</option>
+      </select>
+    </label>
+    <div class='hint'>When we've never received N2k depth this session, what to do.</div>
+
+    <input type='submit' value='Apply (no reboot)'>
+  </form>
+  <div class='note'>⚠ Changes are RAM-only — lost on reboot. Flash a new firmware to make permanent.</div>
+  <div class='links'><a href='/status'>Status</a> <a href='/'>OTA Update</a></div>
+</div>
+<script>
+  // show success banner if ?ok in URL
+  if (location.search.includes('ok')) {
+    document.getElementById('ok').style.display = 'block';
+    setTimeout(()=>document.getElementById('ok').style.display='none', 4000);
+  }
+</script>
+</body>
+</html>
+)rawliteral";
+    server.send(200, "text/html", html);
+}
+
+void handleTunePost() {
+    if (server.hasArg("staleMs")) {
+        int v = server.arg("staleMs").toInt();
+        if (v >= 1000 && v <= 60000) tune.staleMs = (uint16_t)v;
+    }
+    if (server.hasArg("preTxUs")) {
+        int v = server.arg("preTxUs").toInt();
+        if (v >= 10 && v <= 1000) tune.preTxDelayUs = (uint16_t)v;
+    }
+    if (server.hasArg("freshByte11")) {
+        int v = server.arg("freshByte11").toInt();
+        if (v == 0 || v == 2) tune.freshByte11 = (uint8_t)v;
+    }
+    if (server.hasArg("staleByte11")) {
+        int v = server.arg("staleByte11").toInt();
+        if (v == 0 || v == 2) tune.staleByte11 = (uint8_t)v;
+    }
+    if (server.hasArg("pingEnabled")) {
+        tune.pingEnabled = server.arg("pingEnabled").toInt() != 0;
+    }
+    if (server.hasArg("bootFallback")) {
+        tune.bootFallback = server.arg("bootFallback").toInt() != 0;
+    }
+    // Log to serial for debugging
+    Serial.printf("[TUNE] staleMs=%d preTxUs=%d freshB11=0x%02X staleB11=0x%02X ping=%d boot=%d\n",
+                  tune.staleMs, tune.preTxDelayUs,
+                  tune.freshByte11, tune.staleByte11,
+                  tune.pingEnabled, tune.bootFallback);
+    // Redirect back to /tune with success indicator
+    server.sendHeader("Location", "/tune?ok");
+    server.send(303, "text/plain", "Redirecting...");
+}
+
 void handleStatus() {
     const char* html = R"rawliteral(
 <!DOCTYPE html>
@@ -429,6 +602,12 @@ void handleStatus() {
     <tr><td>Last depth poll</td><td id='reqage'>-</td></tr>
     <tr><td>Last ping (0x06)</td><td id='pingage'>-</td></tr>
     <tr><td>Last RS485 reply</td><td id='txage'>-</td></tr>
+    <tr><td colspan='2' style='padding-top:12px;color:#90caf9;font-weight:bold'>Runtime Tuning</td></tr>
+    <tr><td>Stale threshold</td><td id='tstale'>-</td></tr>
+    <tr><td>Pre-TX delay</td><td id='tpretx'>-</td></tr>
+    <tr><td>byte[11] fresh/stale</td><td id='tb11'>-</td></tr>
+    <tr><td>Ping response</td><td id='tping'>-</td></tr>
+    <tr><td>Boot fallback</td><td id='tboot'>-</td></tr>
     <tr><td>Raw RX total</td><td id='rawtotal'>-</td></tr>
     <tr>
       <td colspan='2'>
@@ -437,7 +616,7 @@ void handleStatus() {
       </td>
     </tr>
   </table>
-  <br><a href='/'>Firmware Update</a>
+  <br><a href='/tune'>Tune Parameters</a> &nbsp; <a href='/'>Firmware Update</a>
 </div>
 <script>
 function age(ms){ return ms < 0 ? 'never' : ms + 'ms ago'; }
@@ -474,6 +653,12 @@ function update(){
     document.getElementById('reqage').textContent = age(d.rs485_req_age_ms);
     document.getElementById('pingage').textContent = age(d.rs485_ping_age_ms);
     document.getElementById('txage').textContent = age(d.rs485_tx_age_ms);
+    document.getElementById('tstale').textContent = d.tune_stale_ms + ' ms';
+    document.getElementById('tpretx').textContent = d.tune_pre_tx_us + ' µs';
+    document.getElementById('tb11').textContent =
+      '0x' + d.tune_fresh_b11.toString(16).padStart(2,'0') + ' / 0x' + d.tune_stale_b11.toString(16).padStart(2,'0');
+    document.getElementById('tping').textContent = d.tune_ping_enabled ? 'yes' : 'no';
+    document.getElementById('tboot').textContent = d.tune_boot_fallback ? 'send 0.0ft' : 'suppress';
     document.getElementById('rawtotal').textContent = d.raw_rx_total + ' bytes';
     // format hex in groups of 4 bytes (8 hex chars) for readability
     var h = d.raw_rx_hex;
@@ -493,7 +678,7 @@ setInterval(update, 1000);
 
 void handleData() {
     uint32_t now           = millis();
-    bool acquiredStale     = everHadDepth && ((now - lastDepthMs) > DEPTH_STALE_MS);
+    bool acquiredStale     = everHadDepth && ((now - lastDepthMs) > (uint32_t)tune.staleMs);
     bool fresh             = everHadDepth && !acquiredStale;
     // depth_state: "fresh" | "acquired_stale" | "boot_no_data"
     const char* depthState = fresh ? "fresh" : (acquiredStale ? "acquired_stale" : "boot_no_data");
@@ -518,6 +703,13 @@ void handleData() {
     json += "\"rs485_unknown\":"       + String(statRS485Unknown)    + ",";
     json += "\"rs485_last_crc_fail_hex\":\"" + lastCrcFailHex() + "\",";
     json += "\"rs485_stale_resp\":"    + String(statRS485StaleResp) + ",";
+    // Expose current tuning params in /data for status page display
+    json += "\"tune_stale_ms\":"        + String(tune.staleMs)        + ",";
+    json += "\"tune_pre_tx_us\":"       + String(tune.preTxDelayUs)   + ",";
+    json += "\"tune_fresh_b11\":"       + String(tune.freshByte11)    + ",";
+    json += "\"tune_stale_b11\":"       + String(tune.staleByte11)    + ",";
+    json += "\"tune_ping_enabled\":"    + String(tune.pingEnabled ? "true" : "false") + ",";
+    json += "\"tune_boot_fallback\":"   + String(tune.bootFallback ? "true" : "false") + ",";
     json += "\"poll_interval_cnt\":"   + String(pollIntervalCnt)    + ",";
     json += "\"poll_interval_min_ms\":" + String(pollIntervalCnt ? pollIntervalMin : 0) + ",";
     json += "\"poll_interval_max_ms\":" + String(pollIntervalMax)   + ",";
@@ -556,6 +748,8 @@ void setup() {
     });
     server.on("/status", HTTP_GET, handleStatus);
     server.on("/data",   HTTP_GET, handleData);
+    server.on("/tune",   HTTP_GET,  handleTuneGet);
+    server.on("/tune",   HTTP_POST, handleTunePost);
     server.onNotFound([]() {
         server.send(404, "text/plain", "Not found");
     });
