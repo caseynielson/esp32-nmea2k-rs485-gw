@@ -25,7 +25,7 @@
 #include <freertos/semphr.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.15.1"
+#define SW_VERSION_STRING  "v2.16.0"
 #define SW_BUILD_DATE      "2026-07-02"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -124,6 +124,14 @@ static volatile uint32_t pollIntervalSum  = 0;
 static volatile uint32_t pollIntervalCnt  = 0;
 static volatile uint32_t lastPollArrivalMs = 0;
 
+// ── /drop — response suppression for blink-timing experiments ─────────────────
+// When dropUntilMs > 0, rs485Task silently discards 0x09 depth-poll responses
+// until millis() >= dropUntilMs, then auto-resumes.
+// Written by loop() HTTP handler; read by rs485Task (Core 1).
+// Atomic enough for a single uint32_t on this architecture.
+static volatile uint32_t dropUntilMs   = 0;   // 0 = not dropping
+static volatile uint32_t statDropCount = 0;   // polls suppressed since last /drop
+
 // ── CAN state ─────────────────────────────────────────────────────────────────
 static bool     canReady       = false;
 static uint32_t lastCanRetryMs = 0;
@@ -212,6 +220,19 @@ static void sendDepthResponse() {
     bool acquiredStale = localEverHad && ((now - localLastDepthMs) > (uint32_t)tune.staleMs);
     bool fresh         = localEverHad && !acquiredStale;
     bool bootNoData    = !localEverHad;
+
+    // ── /drop suppression check ───────────────────────────────────────────────
+    // If a /drop window is active, silently eat this poll and return.
+    // The MMDC will time out and (hopefully) blink. Auto-resumes when window expires.
+    if (dropUntilMs > 0) {
+        if (millis() < dropUntilMs) {
+            statDropCount++;
+            statRS485Req++;  // count the poll as seen, just not answered
+            return;          // no response sent
+        } else {
+            dropUntilMs = 0; // window expired — resume normal responses
+        }
+    }
 
     // What depth value to send:
     //   fresh           → current reading from N2k
@@ -558,7 +579,7 @@ void handleTuneGet() {
     <input type='submit' value='Apply (no reboot)'>
   </form>
   <div class='note'>⚠ Changes are RAM-only - lost on reboot. Flash a new firmware to make permanent.</div>
-  <div class='links'><a href='/status'>Status</a> <a href='/'>OTA Update</a></div>
+  <div class='links'><a href='/status'>Status</a> <a href='/drop'>Drop Test</a> <a href='/'>OTA Update</a></div>
 </div>
 <script>
   // show success banner if ?ok in URL
@@ -604,6 +625,75 @@ void handleTunePost() {
     // Redirect back to /tune with success indicator
     server.sendHeader("Location", "/tune?ok");
     server.send(303, "text/plain", "Redirecting...");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// /drop  —  Response-suppression endpoint for blink-timing experiments
+//
+// GET  /drop?ms=N   — suppress 0x09 responses for N ms (max 30000), then auto-resume
+// GET  /drop?ms=0   — cancel an active drop window immediately
+// GET  /drop        — show current drop status
+//
+// Safety:
+//   • Self-cancelling: the window always expires, never needs manual reset
+//   • Max window: 30 s (enough to observe blink + blank; won't leave display dark)
+//   • Reads dropUntilMs; rs485Task sees the change atomically (single uint32 write)
+// ═══════════════════════════════════════════════════════════════════════════════
+void handleDrop() {
+    uint32_t now = millis();
+    String html;
+
+    if (server.hasArg("ms")) {
+        int ms = server.arg("ms").toInt();
+        if (ms == 0) {
+            // Cancel active drop
+            dropUntilMs   = 0;
+            statDropCount = 0;
+            Serial.println("[DROP] Cancelled.");
+            html = "<h2>Drop cancelled</h2><p>Responses resumed immediately.</p>";
+        } else if (ms > 0 && ms <= 30000) {
+            dropUntilMs   = now + (uint32_t)ms;
+            statDropCount = 0;
+            Serial.printf("[DROP] Suppressing responses for %d ms\n", ms);
+            html  = "<h2>Drop active</h2>";
+            html += "<p>Suppressing 0x09 responses for <b>" + String(ms) + " ms</b>.</p>";
+            html += "<p>Auto-resumes at T+" + String(ms) + "ms. Watch the MMDC display.</p>";
+            html += "<p>Record: when does it start blinking? When does it go blank?</p>";
+            html += "<p><a href='/drop'>Refresh status</a> &nbsp; <a href='/drop?ms=0'>Cancel now</a></p>";
+        } else {
+            server.send(400, "text/plain", "ms must be 1-30000");
+            return;
+        }
+    } else {
+        // Status page
+        bool active = (dropUntilMs > 0 && now < dropUntilMs);
+        html  = "<h2>/drop — Response Suppression</h2>";
+        if (active) {
+            uint32_t remaining = dropUntilMs - now;
+            html += "<p style='color:orange'><b>ACTIVE</b> — " + String(remaining) + " ms remaining, ";
+            html += String(statDropCount) + " polls suppressed so far.</p>";
+            html += "<p><a href='/drop?ms=0'>Cancel</a></p>";
+        } else {
+            html += "<p>Inactive. Polls suppressed in last window: " + String(statDropCount) + "</p>";
+        }
+        html += "<hr>";
+        html += "<p>Suppress responses for: ";
+        html += "<a href='/drop?ms=2000'>2s</a> &nbsp; ";
+        html += "<a href='/drop?ms=5000'>5s</a> &nbsp; ";
+        html += "<a href='/drop?ms=10000'>10s</a> &nbsp; ";
+        html += "<a href='/drop?ms=20000'>20s</a> &nbsp; ";
+        html += "<a href='/drop?ms=30000'>30s</a></p>";
+        html += "<p><small>MMDC polls every ~2s — allow at least 2-3 missed polls to see display change.</small></p>";
+    }
+
+    String page = "<!DOCTYPE html><html><head><title>Drop</title>";
+    page += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+    page += "<style>body{background:#181a1b;color:#f1f1f1;font-family:Arial,sans-serif;padding:2em;}";
+    page += "a{color:#90caf9;} h2{color:#90caf9;}</style></head><body>";
+    page += html;
+    page += "<p><a href='/status'>Status</a> &nbsp; <a href='/tune'>Tune</a> &nbsp; <a href='/'>OTA</a></p>";
+    page += "</body></html>";
+    server.send(200, "text/html", page);
 }
 
 void handleStatus() {
@@ -773,7 +863,10 @@ void handleData() {
     json += "\"poll_interval_max_ms\":" + String(pollIntervalMax)   + ",";
     json += "\"poll_interval_avg_ms\":" + String(pollIntervalCnt ? (float)pollIntervalSum/pollIntervalCnt : 0.0f, 1) + ",";
     json += "\"raw_rx_total\":"  + String(rawRxTotal)        + ",";
-    json += "\"raw_rx_hex\":\""  + rawRxHex()                + "\"";
+    json += "\"raw_rx_hex\":\""  + rawRxHex()                + "\",";
+    json += "\"drop_active\":"     + String((dropUntilMs > 0 && now < dropUntilMs) ? "true" : "false") + ",";
+    json += "\"drop_remaining_ms\":" + String((dropUntilMs > 0 && now < dropUntilMs) ? (int32_t)(dropUntilMs - now) : 0) + ",";
+    json += "\"drop_suppressed\":"  + String(statDropCount)    + "";
     json += "}";
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "application/json", json);
@@ -808,6 +901,7 @@ void setup() {
     server.on("/data",   HTTP_GET, handleData);
     server.on("/tune",   HTTP_GET,  handleTuneGet);
     server.on("/tune",   HTTP_POST, handleTunePost);
+    server.on("/drop",   HTTP_GET,  handleDrop);
     server.onNotFound([]() {
         server.send(404, "text/plain", "Not found");
     });
