@@ -25,8 +25,8 @@
 #include <freertos/semphr.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.16.0"
-#define SW_BUILD_DATE      "2026-07-02"
+#define SW_VERSION_STRING  "v2.17.0"
+#define SW_BUILD_DATE      "2026-07-20"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
 const char *ssid     = "nmea2k_rs485_gw";
@@ -235,23 +235,21 @@ static void sendDepthResponse() {
     }
 
     // What depth value to send:
-    //   fresh           → current reading from N2k
-    //   acquired stale  → last good reading (hold last known depth on display)
-    //   boot stale      → 0.0 ft if bootFallback enabled, else suppress
+    //   fresh           → current reading from N2k, respond solid
+    //   acquired stale  → stop responding; MMDC will blink last known value on its own
+    //   boot stale      → stop responding (no last known value to blink)
     uint16_t d = fresh ? localDepthTenths : localLastGoodTenths;
-    if (bootNoData && !tune.bootFallback) {
-        // boot_no_data with fallback disabled - don't respond, let MMDC blank
+    if (!fresh) {
+        // No response when stale or no data — MMDC times out and blinks
+        // the last value it displayed, which is the last good depth we sent.
         statRS485Req++;
+        statRS485StaleResp++;
         lastRS485TxMs = millis();
         return;
     }
 
-    // byte[11] controls display mode.
-    // Hypothesis: 0x02 = solid, 0x00 = blink (invalid depth indicator)
-    // tuneable per state to test without reflashing.
-    uint8_t b11 = fresh ? tune.freshByte11 : tune.staleByte11;
-
-    if (!fresh) statRS485StaleResp++;
+    // byte[11] = 0x02 = solid display (confirmed). Only reach here when fresh.
+    uint8_t b11 = tune.freshByte11;
 
     uint8_t resp[RESPONSE_LEN] = {
         RESPONSE_LEN,
