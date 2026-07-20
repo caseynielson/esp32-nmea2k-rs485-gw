@@ -145,6 +145,36 @@ def send_frame(s: socket.socket, can_id: int, payload: bytes) -> None:
     s.send(frame)
 
 
+def build_raw_frame(depth_ft: float, sid: int = 0) -> bytes:
+    """
+    Build an 8-byte CAN payload that handleDepth() on the ESP32 gateway can
+    parse directly.
+
+    The gateway does NOT reassemble fast-packets.  handleDepth() reads:
+        rawM = data[1] | data[2]<<8 | data[3]<<16 | data[4]<<24
+
+    So we lay out the PGN 128267 payload with NO fast-packet header:
+        data[0] = SID
+        data[1] = depth byte 0 (LSB)
+        data[2] = depth byte 1
+        data[3] = depth byte 2 (MSB, almost always 0)
+        data[4] = depth byte 3 (always 0 for depths < 655 m)
+        data[5] = offset LSB (0x00)
+        data[6] = offset MSB (0x00)
+        data[7] = range      (0xFF = unknown)
+
+    With fast-packet framing the first two bytes would be the fast-packet
+    header (seq|0x00, total_len=7), which places 0x07 in data[1] and shifts
+    all depth bytes two positions right — causing the gateway to read a
+    garbage rawM that exceeds the 30000 guard and drops the frame.
+    """
+    raw = depth_to_raw(depth_ft)
+    d0  =  raw        & 0xFF
+    d1  = (raw >> 8)  & 0xFF
+    d2  = (raw >> 16) & 0xFF
+    return bytes([sid & 0xFF, d0, d1, d2, 0x00, 0x00, 0x00, 0xFF])
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Inject PGN 128267 (water depth) onto a SocketCAN interface')
@@ -158,6 +188,7 @@ def main():
     print(f"[send_depth] iface={args.iface}  depth={args.depth:.1f} ft  "
           f"raw=0x{raw:06X} ({raw})  interval={args.interval:.2f}s")
     print(f"[send_depth] CAN ID=0x{CAN_ID_PGN128267:08X} (PGN 128267, prio=6, SA=0x01)")
+    print(f"[send_depth] NOTE: sending raw PGN payload (no fast-packet header) — matches gateway parser")
     print(f"[send_depth] Press Ctrl+C to stop.\n")
 
     try:
@@ -172,14 +203,12 @@ def main():
     count = 0
     try:
         while args.count == 0 or count < args.count:
-            pgn_data = pgn128267_bytes(args.depth, sid)
-            frames   = build_fast_packet_frames(pgn_data, seq_id=sid)
-            for f in frames:
-                send_frame(s, CAN_EFF_ID, f)
+            frame = build_raw_frame(args.depth, sid)
+            send_frame(s, CAN_EFF_ID, frame)
             sid = (sid + 1) & 0x07
             count += 1
             if count % 10 == 0:
-                print(f"  [{count:6d}] sent {len(frames)} frame(s), depth={args.depth:.1f}ft")
+                print(f"  [{count:6d}] sent depth={args.depth:.1f}ft  frame={frame.hex()}")
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print(f"\n[send_depth] Stopped after {count} transmissions.")
