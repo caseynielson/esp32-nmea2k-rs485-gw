@@ -25,7 +25,7 @@
 #include <freertos/semphr.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.19.1"
+#define SW_VERSION_STRING  "v2.19.2"
 #define SW_BUILD_DATE      "2026-07-20"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -73,6 +73,7 @@ struct TuneParams {
     uint8_t  b9;            // byte[9]  default 0x03
     bool     overrideDepth; // when true, send depthOverride instead of real depth
     uint16_t depthOverride; // raw tenths-of-foot value to send (e.g. 0xFFFF)
+    bool     freezeToggle;  // when true, stop alternating toggleBit (test: does MMDC blink?)
 } tune = {
     .staleMs       = 5000,
     .preTxDelayUs  = 50,
@@ -88,6 +89,7 @@ struct TuneParams {
     .b9            = 0x03,
     .overrideDepth = false,
     .depthOverride = 0xFFFF,
+    .freezeToggle  = false,
 };
 
 // ── RS485 protocol ────────────────────────────────────────────────────────────
@@ -286,7 +288,7 @@ static void sendDepthResponse() {
         0x00
     };
     resp[12] = calcChecksum(resp, 12);
-    toggleBit ^= 1;  // always alternate - frozen toggle = MMDC blanks DEPTH entirely
+    if (!tune.freezeToggle) toggleBit ^= 1;  // frozen toggle test: does MMDC blink or blank?
     statRS485Req++;  // caller may override - see sendPingResponse()
     lastRS485TxMs = millis();
 
@@ -634,6 +636,18 @@ void handleTuneGet() {
     <div class='hint'>e.g. 0x0059 = 8.9 ft, 0xFFFF = invalid marker. Active only when override is Yes.</div>
 
     <h3>Misc</h3>
+    <label>Freeze toggle bit?
+      <select name='freezeToggle'>
+        <option value='0' )rawliteral";
+    html += !tune.freezeToggle ? "selected" : "";
+    html += R"rawliteral(>No — alternate normally (default)</option>
+        <option value='1' )rawliteral";
+    html += tune.freezeToggle ? "selected" : "";
+    html += R"rawliteral(>Yes — freeze toggle (test: blink or blank?)</option>
+      </select>
+    </label>
+    <div class='hint'>Frozen toggle previously caused blank. Testing whether it blinks the last known value.</div>
+
     <label>Respond to cmd=0x06 ping?
       <select name='pingEnabled'>
         <option value='0' )rawliteral";
@@ -704,17 +718,18 @@ void handleTunePost() {
         int v = parseHexArg(server.arg("depthOverride"));
         if (v >= 0 && v <= 0xFFFF) tune.depthOverride = (uint16_t)v;
     }
+    if (server.hasArg("freezeToggle")) tune.freezeToggle = server.arg("freezeToggle").toInt() != 0;
     if (server.hasArg("pingEnabled"))  tune.pingEnabled  = server.arg("pingEnabled").toInt()  != 0;
     if (server.hasArg("bootFallback")) tune.bootFallback = server.arg("bootFallback").toInt() != 0;
 
     Serial.printf("[TUNE] staleMs=%d preTxUs=%d freshB11=0x%02X staleB11=0x%02X "
                   "b2=0x%02X b3=0x%02X b6=0x%02X b7=0x%02X b8=0x%02X b9=0x%02X "
-                  "overrideDepth=%d depthOverride=0x%04X ping=%d boot=%d\n",
+                  "overrideDepth=%d depthOverride=0x%04X freezeToggle=%d ping=%d boot=%d\n",
                   tune.staleMs, tune.preTxDelayUs,
                   tune.freshByte11, tune.staleByte11,
                   tune.b2, tune.b3, tune.b6, tune.b7, tune.b8, tune.b9,
                   tune.overrideDepth, tune.depthOverride,
-                  tune.pingEnabled, tune.bootFallback);
+                  tune.freezeToggle, tune.pingEnabled, tune.bootFallback);
     server.sendHeader("Location", "/tune?ok");
     server.send(303, "text/plain", "Redirecting...");
 }
