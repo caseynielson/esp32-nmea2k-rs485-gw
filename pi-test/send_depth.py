@@ -62,9 +62,18 @@ import time
 import sys
 
 # NMEA 2000 CAN ID for PGN 128267, priority 6, SA=0x01
-# Extended frame flag: bit 31 set for extended (29-bit) IDs in SocketCAN
-CAN_ID_PGN128267 = (6 << 26) | (0xF5 << 16) | (0xFF << 8) | 0x01
-CAN_ID_EFF       = 0x80000000   # extended frame flag
+#
+# PGN 128267 = 0x01F50B
+#   DP  = (128267 >> 16) & 0x01 = 1
+#   PF  = (128267 >>  8) & 0xFF = 0xF5  (245, >= 240 -> PDU2 broadcast)
+#   PS  = (128267      ) & 0xFF = 0x0B  (11, part of PGN in PDU2)
+#
+# 29-bit CAN ID layout: [priority:3][R:1][DP:1][PF:8][PS:8][SA:8]
+#   = (6<<26) | (0<<25) | (1<<24) | (0xF5<<16) | (0x0B<<8) | 0x01
+#   = 0x19F50B01
+#
+CAN_ID_PGN128267 = (6 << 26) | (1 << 24) | (0xF5 << 16) | (0x0B << 8) | 0x01
+CAN_ID_EFF       = 0x80000000   # extended frame flag (SocketCAN: tells kernel this is a 29-bit ID)
 CAN_EFF_ID       = CAN_ID_PGN128267 | CAN_ID_EFF
 
 
