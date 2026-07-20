@@ -187,17 +187,21 @@ def build_raw_frame(depth_ft: float, sid: int = 0) -> bytes:
 def main():
     parser = argparse.ArgumentParser(
         description='Inject PGN 128267 (water depth) onto a SocketCAN interface')
-    parser.add_argument('--depth',    type=float, default=8.9,   help='Depth in feet (default: 8.9)')
+    parser.add_argument('--depth',    type=float, default=None,  help='Fixed depth in feet (default: walk from --start to --end)')
+    parser.add_argument('--start',    type=float, default=5.0,   help='Walk start depth in feet (default: 5.0)')
+    parser.add_argument('--end',      type=float, default=15.0,  help='Walk end depth in feet (default: 15.0)')
     parser.add_argument('--iface',    type=str,   default='can0', help='SocketCAN interface (default: can0)')
     parser.add_argument('--interval', type=float, default=1.0,   help='Send interval in seconds (default: 1.0)')
     parser.add_argument('--count',    type=int,   default=0,     help='Frames to send (0 = infinite)')
     args = parser.parse_args()
 
-    raw = depth_to_raw(args.depth)
-    print(f"[send_depth] iface={args.iface}  depth={args.depth:.1f} ft  "
-          f"raw=0x{raw:06X} ({raw})  interval={args.interval:.2f}s")
+    fixed = args.depth is not None
+    print(f"[send_depth] iface={args.iface}  interval={args.interval:.2f}s")
+    if fixed:
+        print(f"[send_depth] mode=fixed  depth={args.depth:.1f} ft")
+    else:
+        print(f"[send_depth] mode=walk  {args.start:.1f} ft -> {args.end:.1f} ft, step=0.1 ft, bouncing")
     print(f"[send_depth] CAN ID=0x{CAN_ID_PGN128267:08X} (PGN 128267, prio=6, SA=0x01)")
-    print(f"[send_depth] NOTE: sending raw PGN payload (no fast-packet header) — matches gateway parser")
     print(f"[send_depth] Press Ctrl+C to stop.\n")
 
     try:
@@ -210,14 +214,22 @@ def main():
 
     sid = 0
     count = 0
+    # Walking state
+    current = args.start if not fixed else args.depth
+    step    = 0.1
     try:
         while args.count == 0 or count < args.count:
-            frame = build_raw_frame(args.depth, sid)
+            depth = args.depth if fixed else current
+            frame = build_raw_frame(depth, sid)
             send_frame(s, CAN_EFF_ID, frame)
+            print(f"  [{count:6d}] depth={depth:5.1f} ft  frame={frame.hex()}")
             sid = (sid + 1) & 0x07
             count += 1
-            if count % 10 == 0:
-                print(f"  [{count:6d}] sent depth={args.depth:.1f}ft  frame={frame.hex()}")
+            if not fixed:
+                current = round(current + step, 1)
+                if current > args.end or current < args.start:
+                    step = -step
+                    current = round(current + step, 1)
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print(f"\n[send_depth] Stopped after {count} transmissions.")
