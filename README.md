@@ -32,8 +32,6 @@ NMEA 2000 network                ESP32 gateway               Medallion MMDC
 
 The original single-task loop ran the WebServer, CAN reads, and RS485 reads all in sequence. The WebServer library (`server.handleClient()`) introduces synchronous latency spikes of 10–100 ms. If a spike landed between the MMDC sending its depth poll and the ESP32 responding, the MMDC timed out and showed "No Response".
 
-Early attempts at FreeRTOS core-pinning (v2.0) caused USB-CDC serial monitor lockup in the Arduino IDE by starving the Arduino `loopTask`. Time-slicing the web server in `loop()` (v2.1–v2.14) improved things but didn't fully eliminate the problem.
-
 ### The fix (v2.15+)
 
 RS485 polling runs in a dedicated FreeRTOS task at **priority 20**, pinned to Core 1. This completely preempts `loop()` (priority 1) the instant UART bytes arrive.
@@ -44,200 +42,216 @@ Core 1:
   loop()     (priority  1)  ← CAN reads, HTTP, OTA
 ```
 
-`depthMutex` protects the shared depth state between cores. A `vTaskDelay(1 / portTICK_PERIOD_MS)` yield inside the task loop prevents starvation of lower-priority tasks.
+`depthMutex` protects the shared depth state between cores. After extended on-water testing this architecture has proven reliable — zero "No Response" events observed.
 
-After a week of on-water testing this architecture has proven reliable — zero "No Response" events observed.
+## RS485 Protocol (Medallion MMDC) — Fully Reverse-Engineered
 
-## RS485 Protocol (Medallion MMDC)
+### Depth poll request (MMDC → gateway, 4 bytes)
 
-### Request (MMDC → gateway, 4 bytes)
+| Byte | Value  | Description                          |
+|------|--------|--------------------------------------|
+| 0    | `0x04` | Frame length                         |
+| 1    | `0x09` | Command: depth poll                  |
+| 2    | —      | Payload byte (varies)                |
+| 3    | —      | Two's-complement checksum            |
 
-| Byte | Value  | Description        |
-|------|--------|--------------------|
-| 0    | `0x04` | Message length     |
-| 1    | `0x09` | Command: get depth |
-| 2-3  | —      | Two's-complement checksum over bytes 0-1 (see below) |
+### Depth response (gateway → MMDC, 13 bytes)
 
-### Response (gateway → MMDC, 13 bytes)
+| Byte | Value        | Description                                        |
+|------|--------------|----------------------------------------------------|
+| 0    | `0x0D` (13)  | Frame length                                       |
+| 1    | `0x09`       | Command echo                                       |
+| 2    | `0x14`       | **Required** — any other value → "No Response"     |
+| 3    | `0xAA`       | **Required** — any other value → "bad status"      |
+| 4    | depth_lo     | Depth low byte (tenths of a foot, little-endian)   |
+| 5    | depth_hi     | Depth high byte (tenths of a foot, little-endian)  |
+| 6    | `0xFF`       | Filler — no effect when changed                    |
+| 7    | `0x03`       | Filler — no effect when changed                    |
+| 8    | `0xFF`       | Filler — no effect when changed                    |
+| 9    | `0x03`       | Filler — no effect when changed                    |
+| 10   | toggle       | Alternates 0/1 each response — **must alternate**  |
+| 11   | `0x02`       | `0x02` = solid display, `0x00` = blank display     |
+| 12   | checksum     | Two's-complement checksum over bytes 0–11          |
 
-| Byte | Value        | Description                        |
-|------|--------------|------------------------------------|
-| 0    | `0x0D` (13)  | Message length                     |
-| 1    | `0x09`       | Command echo                       |
-| 2    | `0x14`       | Sub-command                        |
-| 3    | `0xAA`       | Status/ID                          |
-| 4    | depth_lo     | Depth low byte (tenths of a foot)  |
-| 5    | depth_hi     | Depth high byte (tenths of a foot) |
-| 6-7  | `0xFF 0x03`  | Filler                             |
-| 8-9  | `0xFF 0x03`  | Filler                             |
-| 10   | toggle       | Bit toggled each response          |
-| 11   | `0x02`       | Filler                             |
-| 12   | checksum     | Two's-complement checksum          |
-
-**Depth encoding:** value = depth_in_feet × 10, rounded to nearest integer.  
+**Depth encoding:** value = `round(depth_ft × 10)`, little-endian uint16.
 Example: 12.3 ft → `0x7B 0x00` (123 decimal).
 
-**Checksum:** 8-bit two's complement of all preceding bytes.  
-`checksum = (~sum(bytes[0..n-2]) + 1) & 0xFF`
+**Checksum:** `checksum = (~sum(bytes[0..11]) + 1) & 0xFF`
 
-**Depth state machine (three states):**
-- **Fresh** — depth received within `staleMs` (default 15 s). Displayed solid.
-- **Acquired-stale** — depth not updated recently, but we've seen depth before. Holds last known value, displayed solid. Garmin MFD already blinks its depth field when invalid, so holding the last value is useful context.
-- **Boot/no-data** — no depth ever received. Responds with 0.0 ft.
+### Display state machine
 
-**Known limitation:** The original factory display blinked when the transducer lost bottom. We have not yet identified a mechanism to trigger MMDC display blinking from the response frame — byte[11] controls solid vs. blank (not blink). The blink is believed to be MMDC-internal behaviour triggered by response absence, not a flag in the response frame. Investigation deferred.
+| State | Depth value sent | Toggle | MMDC display |
+|-------|-----------------|--------|--------------|
+| Fresh N2K depth | Real tenths-of-foot | Alternates | Solid depth value |
+| Stale (no N2K > 5s) | `0xFFFF` | Alternates | Blinks "400" (lost-bottom) |
+| No response | — | — | "No Response" after timeout |
+
+**Key findings from reverse-engineering (2026-07-20):**
+- `byte[2] = 0x14` and `byte[3] = 0xAA` are required — non-negotiable
+- `byte[11]` controls solid (`0x02`) vs blank (`0x00`) — NOT blink
+- **Toggle bit must always alternate** — frozen toggle causes "No Response" blank, not blink
+- **`0xFFFF` depth value** is the NMEA 2000 "not available" sentinel — MMDC recognises it and blinks "400 ft" (its maximum range / lost-bottom indicator)
+- Blinking the last known depth value (original LSM-3 behavior) cannot be replicated — the MMDC does not expose this via the RS485 protocol. "400 blinking" is the closest achievable equivalent.
+
+### MMDC bus cycle (observed, ~8.7 ms period)
+
+Each MMDC cycle:
+1. Status broadcasts: `04 03 05 F4` + `08 03 81 02 00 00 00 72` × 4–5 times
+2. Ping frame: `04 06 XX CS` — **do not respond** (no response window; responding causes RS485 collision)
+3. Depth poll: `04 09 XX CS` — respond within ~1 ms with 13-byte depth frame (~every 2 s)
 
 ## NMEA 2000 PGN 128267 — Water Depth
 
 | Field  | Bytes | Scale     | Notes                  |
 |--------|-------|-----------|------------------------|
 | SID    | 0     | —         | Sequence ID (ignored)  |
-| Depth  | 1-3   | 0.01 m    | 24-bit unsigned        |
-| Offset | 4-5   | 0.001 m   | 16-bit signed          |
+| Depth  | 1–3   | 0.01 m    | 24-bit unsigned        |
+| Offset | 4–5   | 0.001 m   | 16-bit signed          |
 | Range  | 6     | 10 m      | 0xFF = unknown         |
 
-Conversion: `depth_ft = depth_m × 3.28084`, then `depth_tenths = round(depth_ft × 10)`.
+**CAN ID for PGN 128267:** `0x19F50B01` (priority 6, SA=0x01)
+- PGN 128267 = `0x01F50B`: DP=1, PF=0xF5, PS=0x0B (PDU2 broadcast)
+- 29-bit ID: `(6<<26) | (1<<24) | (0xF5<<16) | (0x0B<<8) | SA`
+
+**Frame format:** The gateway reads `data[1..4]` directly as the 32-bit depth value — **no fast-packet reassembly**. Send raw PGN payload bytes without a fast-packet header.
 
 ## Web Interface
 
 Connect to WiFi AP **`nmea2k_rs485_gw`** (password `123456789`) then:
 
-| URL            | Description                        |
-|----------------|------------------------------------|
-| `http://192.168.4.1/`          | Firmware update (HTTP file upload)  |
-| `http://192.168.4.1/logs.html` | Live log viewer with debug toggles  |
-| `http://192.168.4.1/status`    | JSON status (depth, stats, uptime)  |
-| `http://192.168.4.1/tune`      | Runtime parameter adjustment (no reflash needed) |
-
-> **Note:** ArduinoOTA (UDP/mDNS) is intentionally disabled — `ArduinoOTA.begin()` starts a background mDNS task that interferes with USB-CDC serial and causes Arduino IDE lockup on upload. Use the HTTP `/update` page for firmware updates instead.
+| URL                           | Description                              |
+|-------------------------------|------------------------------------------|
+| `http://192.168.4.1/`         | Redirect to /status                      |
+| `http://192.168.4.1/status`   | Live status dashboard                    |
+| `http://192.168.4.1/data`     | JSON data endpoint                       |
+| `http://192.168.4.1/tune`     | Runtime parameter tuning (no reflash)    |
+| `http://192.168.4.1/drop`     | Suppress RS485 responses for N ms (test) |
+| `http://192.168.4.1/ota`      | OTA firmware update                      |
 
 ### `/tune` parameters
 
-| Parameter     | Default  | Notes |
-|---------------|----------|-------|
-| `staleMs`     | 15000    | How long before depth is considered stale (ms) |
-| `preTxDelayUs`| 50       | DE assert delay before RS485 TX (µs) |
-| `freshByte11` | `0x02`   | Byte[11] when depth is fresh — **do not set to 0x00** (blanks display) |
-| `staleByte11` | `0x02`   | Byte[11] when depth is stale |
-| `pingEnabled` | `false`  | Respond to 0x06 ping frames — **leave false** (causes RS485 collision) |
-| `bootFallback`| `true`   | Respond 0.0 ft before first N2K depth received |
+| Parameter      | Default  | Notes |
+|----------------|----------|-------|
+| `staleMs`      | 5000     | ms after last N2K frame before depth considered stale |
+| `preTxDelayUs` | 50       | DE assert delay before RS485 TX (µs) |
+| `freshByte11`  | `0x02`   | byte[11] when fresh — keep `0x02` (solid) |
+| `staleByte11`  | `0x02`   | byte[11] when stale — no effect on blink, keep `0x02` |
+| `b2`–`b9`      | see above| Mystery bytes — tunable for experiments |
+| `overrideDepth`| false    | Send fixed depth value instead of real N2K depth |
+| `depthOverride`| `0xFFFF` | Raw tenths-of-foot override value |
+| `freezeToggle` | false    | Freeze toggle bit — confirmed causes blank, not blink |
+| `pingEnabled`  | false    | Respond to 0x06 ping — **leave false** (RS485 collision) |
+| `bootFallback` | true     | Send 0.0 ft before first N2K depth received |
 
-### `/status` JSON example
+## Pi Test Harness
 
-```json
-{
-  "version": "v2.0.0",
-  "uptime_s": 3742,
-  "depth_ft": 12.3,
-  "depth_valid": true,
-  "depth_rx": 1250,
-  "rs485_req": 3741,
-  "rs485_bad": 0,
-  "dbg_nmea": false,
-  "dbg_rs485": false
-}
+A Raspberry Pi with an MCP2515 CAN hat can inject synthetic NMEA 2000 depth frames for bench testing without being on the water.
+
+### Setup
+
+```bash
+# Bring up SocketCAN interface (250 kbps)
+./pi-test/setup_can.sh
+
+# Inject fixed depth
+python3 pi-test/send_depth.py --depth 8.9 --iface can0
+
+# Walk depth 5.0→15.0 ft in 0.1 ft steps (bouncing) — confirms display is live
+python3 pi-test/send_depth.py --start 5.0 --end 15.0 --iface can0
 ```
 
-## Serial Console (115200 baud)
+### CAN ID note
 
-Serial commands are minimal — full debug control is available via the web interface at `/logs.html`.
-
-| Command     | Description                   |
-|-------------|-------------------------------|
-| `nmea on`   | Enable NMEA 2000 debug output |
-| `nmea off`  | Disable NMEA 2000 debug output|
-| `rs485 on`  | Enable RS485 debug output     |
-| `rs485 off` | Disable RS485 debug output    |
-
-## Test Harness
-
-The full test loop:
-
-```
-Raspberry Pi                      ESP32 gateway              MMDC mimic (esp32_mimic_mmdc)
-────────────                      ─────────────              ─────────────────────────────
-canplayer replays .log  ────────▶ receives PGN 128267  ◀──── polls depth every 1 s
-(NMEA 2000 CAN frames)            converts & caches          prints depth to Serial
+PGN 128267 CAN ID = `0x19F50B01`. The EFF flag (`0x80000000`) must be OR'd in for SocketCAN:
+```python
+CAN_EFF_ID = 0x19F50B01 | 0x80000000  # = 0x99F50B01
 ```
 
-- **Pi side:** `canplayer` or `cangen` on the SocketCAN interface, replaying a capture that includes PGN 128267 frames.
-- **MMDC mimic:** [`esp32_mimic_mmdc`](https://github.com/caseynielson/esp32_mimic_mmdc) — same MAX485 pinout, sends `0x04 0x09 0x11 0xE2` every second and prints the extracted depth. Confirms the gateway is responding correctly without needing a real MMDC on the bench.
+### Frame format note
+
+The gateway reads depth from `data[1..4]` directly. Send **raw PGN payload** (no fast-packet header):
+```
+data[0] = SID
+data[1] = depth byte 0 (LSB)
+data[2] = depth byte 1
+data[3] = depth byte 2
+data[4] = 0x00
+data[5] = offset LSB
+data[6] = offset MSB
+data[7] = range (0xFF)
+```
+A fast-packet header (`seq|0x00`, `total_len`) in bytes 0–1 puts `0x07` (length) into `data[1]`, which produces rawM > 30000 and the frame is dropped.
 
 ## Dependencies
 
 - [ESP32-TWAI-CAN](https://github.com/handmade0octopus/ESP32-TWAI-CAN)
-- Arduino ESP32 core ≥ 2.x
+- Arduino ESP32 core 2.0.17 (**do not upgrade** — core 3.x breaks this sketch)
 - Standard Arduino libraries: `WiFi`, `WebServer`, `Update`
 
 ## Building
 
-Open `esp32_nmea2k_rs485_v2.ino` in Arduino IDE. Select board **ESP32 Dev Module** (or your specific variant). Flash normally or use the OTA update page after first flash.
+Open `esp32_nmea2k_rs485_v2.ino` in Arduino IDE. Board: **ESP32 Dev Module**, core **2.0.17**. Flash via USB or OTA (`/ota`).
+
+> **Note:** ArduinoOTA (UDP/mDNS) is disabled — it starts a background mDNS task that interferes with USB-CDC serial and causes Arduino IDE lockup. Use the HTTP `/ota` page instead.
 
 ## Changelog
 
-### v2.15.1 — 2026-07-02 ✅ Current (field-tested)
-- **Reliability:** RS485 task priority raised from 2 → 20 to match the mefi-nmea2k-gateway pattern. Ensures rs485Task preempts any priority-1 work without contest.
-- **Status:** One week of on-water testing confirmed zero "No Response" events. Depth solid on both gauge cluster and MMDC MFD depth screen.
+### v2.19.2 — 2026-07-20 ✅ Current
+- **Feature:** Add `freezeToggle` to `/tune` — confirmed frozen toggle causes blank, not blink
+- **Tune:** All mystery frame bytes (`b2`, `b3`, `b6`–`b9`) now individually tunable from `/tune`
+- **Tune:** Free hex input for `byte[11]` (was limited to 0x00/0x02 dropdown)
+- **Tune:** Depth override with arbitrary raw value (e.g. `0xFFFF`)
+
+### v2.19.1 — 2026-07-20
+- **Tune:** Default `staleMs` reduced from 15 s → 5 s
+
+### v2.19.0 — 2026-07-20
+- **Feature:** Send `0xFFFF` when N2K depth stale — MMDC blinks "400" (lost-bottom indicator)
+- Confirmed by experiment: `0xFFFF` is the NMEA 2000 "not available" sentinel; MMDC recognises it natively and blinks its maximum range value
+- Accepted as final stale behavior — blinking last known value not achievable via this protocol
+
+### v2.18.0 — 2026-07-20
+- **Feature:** Expand `/tune` to expose all mystery frame bytes for runtime experimentation
+- Added depth override, free hex byte[11] input, b2/b3/b6–b9 fields
+- Reverse-engineering findings documented: byte[2]=0x14 and byte[3]=0xAA required; bytes[6–9] have no observed effect; byte[11] controls solid/blank not blink
+
+### v2.16.0–v2.17.0 — 2026-07-20
+- Bench test infrastructure: Raspberry Pi CAN injection confirmed working
+- Fixed `send_depth.py`: wrong CAN ID (0x18F5FF01 → 0x19F50B01) and fast-packet header bug
+- v2.17.0 reverted (incorrect stale-suppression approach)
+
+### v2.15.1 — 2026-07-02
+- **Reliability:** RS485 task priority raised to 20. Zero "No Response" events in field testing.
 
 ### v2.15.0 — 2026-07-02
-- **Architecture change:** RS485 polling moved from `loop()` to a dedicated FreeRTOS task (Core 1, priority 2). Completely eliminates missed poll responses caused by `server.handleClient()` blocking `loop()` for 10–100 ms.
-- Added `depthMutex` to protect shared depth state between cores.
+- **Architecture:** RS485 polling moved to dedicated FreeRTOS task (Core 1, priority 20)
+- `depthMutex` added for cross-core depth state protection
 
 ### v2.14.0 — 2026-07-02
-- **Regression fix:** `pingEnabled` defaulted to `true` in v2.13.0 — reverted to `false`. Responding to 0x06 ping causes RS485 collision because MMDC issues 0x06 and 0x09 back-to-back with zero gap; our 13-byte response overlaps the MMDC's next broadcast.
-- `/tune` endpoint retained for diagnostic use.
+- `pingEnabled` defaulted back to `false` (v2.13 regression — responding to 0x06 ping causes RS485 collision)
 
 ### v2.13.0 — 2026-07-02
-- **Feature:** `/tune` HTTP endpoint — adjust runtime parameters without reflash (`staleMs`, `preTxDelayUs`, `freshByte11`, `staleByte11`, `pingEnabled`, `bootFallback`).
-- Blink hypothesis support added (byte[11] tunable). Later confirmed: no blink flag exists in the depth response frame.
+- `/tune` HTTP endpoint added
 
 ### v2.12.0 — 2026-07-02
-- **Feature:** Respond to cmd=0x06 ping frames + poll interval tracking (min/avg/max) on `/status`.
-- **Regression:** 0x06 response caused RS485 collision — reverted in v2.14.0.
+- Respond to cmd=0x06 ping + poll interval tracking (later found to cause collision — disabled by default)
 
 ### v2.7.0–v2.11.0 — 2026-06-28 to 2026-07-01
-- Depth stale threshold increased 5 s → 15 s
-- CAN drain increased 1 → 8 frames per `loop()` iteration
-- RS485 RX ring buffer increased to 128 bytes
-- `FRAME_MAX_LEN` increased 16 → 32 to handle longer unknown MMDC frames
-- Pre-TX delay reduced 200 µs → 50 µs
+- Stale threshold 5 s → 15 s (later reduced back to 5 s in v2.19.1)
+- CAN drain 1 → 8 frames per iteration
+- RS485 RX ring buffer 128 bytes
+- `FRAME_MAX_LEN` 16 → 32
+- Pre-TX delay 200 µs → 50 µs
 - Three-state depth model: fresh / acquired-stale / boot-no-data
-- Toggle bit always alternates (frozen toggle causes MMDC blank, not blink — confirmed)
-- `statRS485StaleResp` counter added
+- Toggle confirmed: frozen = blank (not blink)
 
 ### v2.4.0 — 2026-06-28
-- **Bugfix:** Post-transmit DE/RE hold increased from 100 µs → 250 µs. At 76800 baud one byte takes ~130 µs to clock out of the UART shift register after `flush()` returns. The previous 100 µs could drop the driver enable before the stop bit finished, corrupting the last byte of every response.
-- **Feature:** CAN auto-retry — if `ESP32Can.begin()` fails at boot, `maybeRetryCAN()` reattempts every 5 s. NMEA 2000 networks can take a few seconds to stabilise after power-on, so the initial attempt can fail even when hardware is fine. Retry count visible on status page.
-- **Feature:** Raw RS485 RX sniffer — every byte received from the MMDC (before framing/checksum) is captured in a 64-byte ring buffer and displayed on the `/status` page as hex. Shows unknown message types that the current framer discards, making it possible to spot protocol issues without a logic analyser.
-- **Feature:** `/status` page now shows CAN ready state (green/red), CAN retry count, RS485 bad-frame count highlighted in amber, raw RX byte count, and the live raw hex dump.
-- **Feature:** `/data` JSON adds `can_ready`, `can_retries`, `raw_rx_total`, `raw_rx_hex` fields.
+- DE/RE hold increased 100 µs → 250 µs (was dropping stop bit)
+- CAN auto-retry on boot failure
+- Raw RS485 RX sniffer on `/status`
 
-### v2.1.0 — 2026-04-16
-- **Bugfix:** Removed `xTaskCreatePinnedToCore` entirely — pinning rs485Task to Core 1 at priority 10 was starving the Arduino `loopTask` and causing USB-CDC serial monitor lockup / IDE freeze on upload
-- RS485 handling moved back to `loop()` as first call, time-sliced web/OTA handlers prevent them from blocking
-- No mutexes needed (single-task, single Serial owner)
-- `handleWeb()` and `handleOTA()` rate-limited with millis() guards (5ms and 10ms budgets)
-
-### v2.0.1 — 2026-04-16
-- **Bugfix:** `logMsg()` no longer calls `Serial.write()` directly — was causing USB-CDC serial monitor lockup and Arduino IDE freeze when called from Core 1
-- Core 0 now owns all Serial output via `drainLogToSerial()` in `loop()`
-- Bumped `rs485Task` stack from 2 kB → 4 kB for headroom
-
-### v2.0.0 — 2026-04-16
-- **Reliability fix:** RS485 response task pinned to Core 1 at priority 10 — completely decoupled from web server latency
-- **CAN:** `drainCAN()` now empties the full TWAI RX queue per loop iteration instead of reading one frame
-- **Mutex:** `depthMutex` protects shared depth state between cores
-- **New:** `/status` JSON endpoint
-- **Cleanup:** removed dead code, simplified PGN table, log writes are mutex-protected
-
-### v2.1.0–v2.3.7 — 2026-04-16 to 2026-06-27
-- Removed FreeRTOS core-pinning (was causing Arduino IDE USB-CDC lockup)
-- RS485 moved back to `loop()` as first call; time-sliced web/OTA handlers
-- Various label and diagnostic tweaks
-
-### v2.0.0 — 2026-04-16
-- First FreeRTOS attempt: RS485 task on Core 1 priority 10
-- Caused USB-CDC serial lockup in Arduino IDE; abandoned
+### v2.0.0–v2.3.x — 2026-04-16
+- FreeRTOS attempt (caused USB-CDC lockup), reverted, rearchitected
 
 ### v1.5.1 — 2025-09-11
-- Initial working version (single-task, reliability issues under web server load)
+- Initial working version
