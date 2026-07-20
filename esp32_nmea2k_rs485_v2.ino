@@ -25,7 +25,7 @@
 #include <freertos/semphr.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.19.0"
+#define SW_VERSION_STRING  "v2.19.1"
 #define SW_BUILD_DATE      "2026-07-20"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ struct TuneParams {
     bool     overrideDepth; // when true, send depthOverride instead of real depth
     uint16_t depthOverride; // raw tenths-of-foot value to send (e.g. 0xFFFF)
 } tune = {
-    .staleMs       = 15000,
+    .staleMs       = 5000,
     .preTxDelayUs  = 50,
     .freshByte11   = 0x02,
     .staleByte11   = 0x02,
@@ -102,7 +102,7 @@ struct TuneParams {
 
 // ── Depth state ───────────────────────────────────────────────────────────────
 // stale threshold is now runtime-tunable via tune.staleMs
-#define DEPTH_STALE_MS_DEFAULT 15000
+#define DEPTH_STALE_MS_DEFAULT 5000
 
 // Shared between Core 0 (CAN/N2k writer) and Core 1 (RS485 reader).
 // All reads/writes in handleDepth() and sendDepthResponse() must hold depthMutex.
