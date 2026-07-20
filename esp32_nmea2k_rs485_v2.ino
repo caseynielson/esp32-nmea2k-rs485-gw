@@ -25,8 +25,8 @@
 #include <freertos/semphr.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.16.0"
-#define SW_BUILD_DATE      "2026-07-02"
+#define SW_VERSION_STRING  "v2.18.0"
+#define SW_BUILD_DATE      "2026-07-20"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
 const char *ssid     = "nmea2k_rs485_gw";
@@ -60,21 +60,34 @@ HardwareSerial RS485Serial(2);
 struct TuneParams {
     uint16_t staleMs;       // ms before depth is considered stale
     uint16_t preTxDelayUs;  // μs DE asserted before first byte
-    uint8_t  freshByte11;   // response byte[11] when depth is FRESH (solid display)
-    uint8_t  staleByte11;   // response byte[11] when depth is STALE (blink candidate)
+    uint8_t  freshByte11;   // response byte[11] when depth is FRESH
+    uint8_t  staleByte11;   // response byte[11] when depth is STALE
     bool     pingEnabled;   // whether to respond to cmd=0x06 ping frames
     bool     bootFallback;  // send 0.0ft response when no N2k depth ever received
+    // Mystery bytes — tunable for reverse-engineering MMDC blink behavior
+    uint8_t  b2;            // byte[2]  default 0x14
+    uint8_t  b3;            // byte[3]  default 0xAA
+    uint8_t  b6;            // byte[6]  default 0xFF
+    uint8_t  b7;            // byte[7]  default 0x03
+    uint8_t  b8;            // byte[8]  default 0xFF
+    uint8_t  b9;            // byte[9]  default 0x03
+    bool     overrideDepth; // when true, send depthOverride instead of real depth
+    uint16_t depthOverride; // raw tenths-of-foot value to send (e.g. 0xFFFF)
 } tune = {
-    .staleMs      = 15000,  // default: 15s stale window
-    .preTxDelayUs = 50,     // default: 50μs pre-TX delay
-    .freshByte11  = 0x02,   // confirmed solid display
-    .staleByte11  = 0x02,   // TEST: 0x00 may trigger blink - start same as fresh
-    .pingEnabled  = false,  // DO NOT respond to cmd=0x06 by default.
-                            // The MMDC does NOT open a response window after 0x06 --
-                            // it immediately continues broadcasting. Responding causes
-                            // RS485 collisions that corrupt our real 0x09 response.
-                            // Enable only for testing via /tune.
-    .bootFallback = true,   // send 0.0ft when no depth yet
+    .staleMs       = 15000,
+    .preTxDelayUs  = 50,
+    .freshByte11   = 0x02,
+    .staleByte11   = 0x02,
+    .pingEnabled   = false,
+    .bootFallback  = true,
+    .b2            = 0x14,
+    .b3            = 0xAA,
+    .b6            = 0xFF,
+    .b7            = 0x03,
+    .b8            = 0xFF,
+    .b9            = 0x03,
+    .overrideDepth = false,
+    .depthOverride = 0xFFFF,
 };
 
 // ── RS485 protocol ────────────────────────────────────────────────────────────
@@ -253,13 +266,15 @@ static void sendDepthResponse() {
 
     if (!fresh) statRS485StaleResp++;
 
+    if (tune.overrideDepth) d = tune.depthOverride;
+
     uint8_t resp[RESPONSE_LEN] = {
         RESPONSE_LEN,
         MSG_CMD_DEPTH,
-        0x14, 0xAA,
+        tune.b2, tune.b3,
         (uint8_t)(d & 0xFF), (uint8_t)(d >> 8),
-        0xFF, 0x03,
-        0xFF, 0x03,
+        tune.b6, tune.b7,
+        tune.b8, tune.b9,
         toggleBit,
         b11,
         0x00
@@ -483,6 +498,22 @@ const char *update_success_html = R"rawliteral(
 
 // ── /tune endpoint ───────────────────────────────────────────────────────────
 
+// Helper: format a uint8_t as a 2-char hex string for HTML input defaults
+String hexByte(uint8_t v) {
+    char buf[3];
+    snprintf(buf, sizeof(buf), "%02X", v);
+    return String(buf);
+}
+// Helper: parse "0xNN" or "NN" hex string, return -1 on error
+int parseHexArg(const String& s) {
+    String t = s;
+    t.trim();
+    if (t.startsWith("0x") || t.startsWith("0X")) t = t.substring(2);
+    if (t.length() == 0 || t.length() > 4) return -1;
+    for (char c : t) if (!isxdigit(c)) return -1;
+    return (int)strtol(t.c_str(), nullptr, 16);
+}
+
 void handleTuneGet() {
     String html = R"rawliteral(
 <!DOCTYPE html>
@@ -491,98 +522,140 @@ void handleTuneGet() {
   <title>Tune - NMEA2k RS485 Gateway</title>
   <meta name='viewport' content='width=device-width, initial-scale=1'>
   <style>
-    body{background:#181a1b;color:#f1f1f1;font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
-    .card{background:#23272a;border-radius:12px;padding:2em 2.5em;box-shadow:0 2px 16px #000a;min-width:340px;max-width:480px;width:100%;}
-    h2{color:#90caf9;margin-top:0;}
-    label{display:block;color:#90caf9;margin-top:1.1em;font-size:0.92em;}
-    .hint{color:#888;font-size:0.82em;margin-top:2px;}
+    body{background:#181a1b;color:#f1f1f1;font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:1em;box-sizing:border-box;}
+    .card{background:#23272a;border-radius:12px;padding:2em 2.5em;box-shadow:0 2px 16px #000a;min-width:340px;max-width:520px;width:100%;}
+    h2{color:#90caf9;margin-top:0;}h3{color:#90caf9;margin:1.2em 0 0.4em;font-size:1em;border-bottom:1px solid #333;padding-bottom:4px;}
+    label{display:block;color:#b0c4d8;margin-top:0.9em;font-size:0.92em;}
+    .hint{color:#888;font-size:0.80em;margin-top:2px;}
     input[type=number],input[type=text]{background:#181a1b;border:1px solid #444;border-radius:6px;color:#f1f1f1;padding:0.4em 0.7em;width:100%;box-sizing:border-box;font-size:1em;margin-top:4px;}
-    .row{display:flex;gap:1em;align-items:center;margin-top:1em;}
-    .row label{margin-top:0;flex:1;}
+    .hexrow{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0.7em;margin-top:0.5em;}
+    .hexrow label{margin-top:0;}
     select{background:#181a1b;border:1px solid #444;border-radius:6px;color:#f1f1f1;padding:0.4em 0.7em;font-size:1em;width:100%;margin-top:4px;}
     input[type=submit]{background:#1976d2;color:#f1f1f1;padding:0.7em 2em;border:none;border-radius:6px;font-size:1em;cursor:pointer;margin-top:1.5em;width:100%;}
     input[type=submit]:hover{background:#1565c0;}
     .note{color:#ffcc80;font-size:0.83em;margin-top:1.2em;}
-    .links{margin-top:1.4em;display:flex;gap:1.5em;}
+    .links{margin-top:1.4em;display:flex;gap:1.5em;flex-wrap:wrap;}
     .links a{color:#90caf9;}
     .banner{background:#1b3a1b;border:1px solid #388e3c;border-radius:8px;padding:0.7em 1em;color:#b0f2bc;font-size:0.88em;margin-bottom:1em;display:none;}
+    .frame{background:#181a1b;border:1px solid #333;border-radius:6px;padding:0.5em 0.8em;font-family:monospace;font-size:0.85em;color:#aaa;margin-top:0.5em;word-break:break-all;}
   </style>
 </head>
 <body>
 <div class='card'>
   <h2>🔧 Tuning Parameters</h2>
-  <div class='banner' id='ok'>✓ Parameters applied - no reboot needed.</div>
+  <div class='banner' id='ok'>✓ Applied — no reboot needed.</div>
   <form method='POST' action='/tune'>
 
+    <h3>Timing</h3>
     <label>Stale threshold (ms)
       <input type='number' name='staleMs' min='1000' max='60000' step='500' value=')rawliteral";
     html += String(tune.staleMs);
-    html += R"rawliteral('>
-    </label>
-    <div class='hint'>How long after last N2k depth frame before we consider it stale. Default: 15000 ms.</div>
+    html += R"rawliteral('></label>
+    <div class='hint'>How long after last N2k frame before depth is stale. Default: 15000 ms.</div>
 
     <label>Pre-TX delay (μs)
       <input type='number' name='preTxUs' min='10' max='1000' step='10' value=')rawliteral";
     html += String(tune.preTxDelayUs);
-    html += R"rawliteral('>
-    </label>
-    <div class='hint'>DE assert to first byte gap. 50μs works; increase if TX collisions suspected.</div>
+    html += R"rawliteral('></label>
+    <div class='hint'>DE assert to first byte gap. Default: 50 μs.</div>
 
-    <label>byte[11] - FRESH depth (0x02 = solid, 0x00 = blink)
-      <select name='freshByte11'>
+    <h3>byte[11] — display mode</h3>
+    <label>byte[11] FRESH (solid=0x02)
+      <input type='text' name='freshByte11' maxlength='4' value='0x)rawliteral";
+    html += hexByte(tune.freshByte11);
+    html += R"rawliteral('></label>
+    <div class='hint'>Sent when N2k depth is current. 0x02=solid confirmed. Try other values.</div>
+
+    <label>byte[11] STALE
+      <input type='text' name='staleByte11' maxlength='4' value='0x)rawliteral";
+    html += hexByte(tune.staleByte11);
+    html += R"rawliteral('></label>
+    <div class='hint'>Sent when depth is stale. 0x02=solid, 0x00=blank. Looking for blink value.</div>
+
+    <h3>Mystery bytes — reverse-engineer blink</h3>
+    <div class='hint'>Response frame: [0D][09][b2][b3][d_lo][d_hi][b6][b7][b8][b9][tog][b11][CS]</div>
+    <div class='hexrow'>
+      <label>byte[2]
+        <input type='text' name='b2' maxlength='4' value='0x)rawliteral";
+    html += hexByte(tune.b2);
+    html += R"rawliteral('></label>
+      <label>byte[3]
+        <input type='text' name='b3' maxlength='4' value='0x)rawliteral";
+    html += hexByte(tune.b3);
+    html += R"rawliteral('></label>
+      <label>&nbsp;</label>
+    </div>
+    <div class='hint'>Default: 0x14 0xAA — meaning unknown.</div>
+    <div class='hexrow'>
+      <label>byte[6]
+        <input type='text' name='b6' maxlength='4' value='0x)rawliteral";
+    html += hexByte(tune.b6);
+    html += R"rawliteral('></label>
+      <label>byte[7]
+        <input type='text' name='b7' maxlength='4' value='0x)rawliteral";
+    html += hexByte(tune.b7);
+    html += R"rawliteral('></label>
+      <label>byte[8]
+        <input type='text' name='b8' maxlength='4' value='0x)rawliteral";
+    html += hexByte(tune.b8);
+    html += R"rawliteral('></label>
+    </div>
+    <div class='hexrow'>
+      <label>byte[9]
+        <input type='text' name='b9' maxlength='4' value='0x)rawliteral";
+    html += hexByte(tune.b9);
+    html += R"rawliteral('></label>
+      <label>&nbsp;</label>
+      <label>&nbsp;</label>
+    </div>
+    <div class='hint'>Default: 0xFF 0x03 0xFF 0x03 — possibly keel offset / secondary depth pair.</div>
+
+    <h3>Depth override</h3>
+    <label>Override depth value?
+      <select name='overrideDepth'>
         <option value='0' )rawliteral";
-    html += (tune.freshByte11 == 0x00) ? "selected" : "";
-    html += R"rawliteral(>0x00 (blink)</option>
-        <option value='2' )rawliteral";
-    html += (tune.freshByte11 == 0x02) ? "selected" : "";
-    html += R"rawliteral(>0x02 (solid)</option>
-      </select>
-    </label>
-    <div class='hint'>Controls MMDC display mode when N2k data is current. Normally 0x02 (solid).</div>
-
-    <label>byte[11] - STALE/BOOT depth (hypothesis: 0x00 = blink)
-      <select name='staleByte11'>
-        <option value='0' )rawliteral";
-    html += (tune.staleByte11 == 0x00) ? "selected" : "";
-    html += R"rawliteral(>0x00 (blink - test this!)</option>
-        <option value='2' )rawliteral";
-    html += (tune.staleByte11 == 0x02) ? "selected" : "";
-    html += R"rawliteral(>0x02 (solid)</option>
-      </select>
-    </label>
-    <div class='hint'>byte[11] sent when depth is stale or no N2k data. Try 0x00 to test if MMDC blinks.</div>
-
-    <label>Respond to cmd=0x06 ping frames?
-      <select name='pingEnabled'>
+    html += !tune.overrideDepth ? "selected" : "";
+    html += R"rawliteral(>No — send real N2k depth</option>
         <option value='1' )rawliteral";
-    html += tune.pingEnabled ? "selected" : "";
-    html += R"rawliteral(>Yes (recommended)</option>
+    html += tune.overrideDepth ? "selected" : "";
+    html += R"rawliteral(>Yes — send override value below</option>
+      </select>
+    </label>
+    <label>Override depth (raw tenths-of-foot, hex)
+      <input type='text' name='depthOverride' maxlength='6' value='0x)rawliteral";
+    html += String(tune.depthOverride, HEX);
+    html += R"rawliteral('></label>
+    <div class='hint'>e.g. 0x0059 = 8.9 ft, 0xFFFF = invalid marker. Active only when override is Yes.</div>
+
+    <h3>Misc</h3>
+    <label>Respond to cmd=0x06 ping?
+      <select name='pingEnabled'>
         <option value='0' )rawliteral";
     html += !tune.pingEnabled ? "selected" : "";
-    html += R"rawliteral(>No (depth poll only)</option>
+    html += R"rawliteral(>No (safe default)</option>
+        <option value='1' )rawliteral";
+    html += tune.pingEnabled ? "selected" : "";
+    html += R"rawliteral(>Yes (causes RS485 collisions — test only)</option>
       </select>
     </label>
-    <div class='hint'>Sending a depth frame on each 0x06 ping may keep display timer alive between polls.</div>
 
     <label>Boot fallback (no N2k data yet)
       <select name='bootFallback'>
         <option value='1' )rawliteral";
     html += tune.bootFallback ? "selected" : "";
-    html += R"rawliteral(>Send 0.0 ft (show something)</option>
+    html += R"rawliteral(>Send 0.0 ft</option>
         <option value='0' )rawliteral";
     html += !tune.bootFallback ? "selected" : "";
-    html += R"rawliteral(>Suppress response (let MMDC blank)</option>
+    html += R"rawliteral(>Suppress (MMDC blank)</option>
       </select>
     </label>
-    <div class='hint'>When we've never received N2k depth this session, what to do.</div>
 
     <input type='submit' value='Apply (no reboot)'>
   </form>
-  <div class='note'>⚠ Changes are RAM-only - lost on reboot. Flash a new firmware to make permanent.</div>
-  <div class='links'><a href='/status'>Status</a> <a href='/drop'>Drop Test</a> <a href='/'>OTA Update</a></div>
+  <div class='note'>⚠ RAM-only — lost on reboot. OTA to make permanent.</div>
+  <div class='links'><a href='/status'>Status</a> <a href='/drop'>Drop Test</a> <a href='/'>OTA</a></div>
 </div>
 <script>
-  // show success banner if ?ok in URL
   if (location.search.includes('ok')) {
     document.getElementById('ok').style.display = 'block';
     setTimeout(()=>document.getElementById('ok').style.display='none', 4000);
@@ -603,26 +676,39 @@ void handleTunePost() {
         int v = server.arg("preTxUs").toInt();
         if (v >= 10 && v <= 1000) tune.preTxDelayUs = (uint16_t)v;
     }
-    if (server.hasArg("freshByte11")) {
-        int v = server.arg("freshByte11").toInt();
-        if (v == 0 || v == 2) tune.freshByte11 = (uint8_t)v;
+    // Hex byte fields — accept 0xNN or NN
+    auto applyHexByte = [&](const char* arg, uint8_t& field) {
+        if (server.hasArg(arg)) {
+            int v = parseHexArg(server.arg(arg));
+            if (v >= 0 && v <= 0xFF) field = (uint8_t)v;
+        }
+    };
+    applyHexByte("freshByte11",  tune.freshByte11);
+    applyHexByte("staleByte11",  tune.staleByte11);
+    applyHexByte("b2",           tune.b2);
+    applyHexByte("b3",           tune.b3);
+    applyHexByte("b6",           tune.b6);
+    applyHexByte("b7",           tune.b7);
+    applyHexByte("b8",           tune.b8);
+    applyHexByte("b9",           tune.b9);
+    if (server.hasArg("overrideDepth")) {
+        tune.overrideDepth = server.arg("overrideDepth").toInt() != 0;
     }
-    if (server.hasArg("staleByte11")) {
-        int v = server.arg("staleByte11").toInt();
-        if (v == 0 || v == 2) tune.staleByte11 = (uint8_t)v;
+    if (server.hasArg("depthOverride")) {
+        int v = parseHexArg(server.arg("depthOverride"));
+        if (v >= 0 && v <= 0xFFFF) tune.depthOverride = (uint16_t)v;
     }
-    if (server.hasArg("pingEnabled")) {
-        tune.pingEnabled = server.arg("pingEnabled").toInt() != 0;
-    }
-    if (server.hasArg("bootFallback")) {
-        tune.bootFallback = server.arg("bootFallback").toInt() != 0;
-    }
-    // Log to serial for debugging
-    Serial.printf("[TUNE] staleMs=%d preTxUs=%d freshB11=0x%02X staleB11=0x%02X ping=%d boot=%d\n",
+    if (server.hasArg("pingEnabled"))  tune.pingEnabled  = server.arg("pingEnabled").toInt()  != 0;
+    if (server.hasArg("bootFallback")) tune.bootFallback = server.arg("bootFallback").toInt() != 0;
+
+    Serial.printf("[TUNE] staleMs=%d preTxUs=%d freshB11=0x%02X staleB11=0x%02X "
+                  "b2=0x%02X b3=0x%02X b6=0x%02X b7=0x%02X b8=0x%02X b9=0x%02X "
+                  "overrideDepth=%d depthOverride=0x%04X ping=%d boot=%d\n",
                   tune.staleMs, tune.preTxDelayUs,
                   tune.freshByte11, tune.staleByte11,
+                  tune.b2, tune.b3, tune.b6, tune.b7, tune.b8, tune.b9,
+                  tune.overrideDepth, tune.depthOverride,
                   tune.pingEnabled, tune.bootFallback);
-    // Redirect back to /tune with success indicator
     server.sendHeader("Location", "/tune?ok");
     server.send(303, "text/plain", "Redirecting...");
 }
