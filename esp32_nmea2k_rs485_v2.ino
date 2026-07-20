@@ -25,7 +25,7 @@
 #include <freertos/semphr.h>
 
 // ── Version ───────────────────────────────────────────────────────────────────
-#define SW_VERSION_STRING  "v2.18.0"
+#define SW_VERSION_STRING  "v2.19.0"
 #define SW_BUILD_DATE      "2026-07-20"
 
 // ── WiFi AP ───────────────────────────────────────────────────────────────────
@@ -248,21 +248,27 @@ static void sendDepthResponse() {
     }
 
     // What depth value to send:
-    //   fresh           → current reading from N2k
-    //   acquired stale  → last good reading (hold last known depth on display)
-    //   boot stale      → 0.0 ft if bootFallback enabled, else suppress
-    uint16_t d = fresh ? localDepthTenths : localLastGoodTenths;
-    if (bootNoData && !tune.bootFallback) {
-        // boot_no_data with fallback disabled - don't respond, let MMDC blank
-        statRS485Req++;
-        lastRS485TxMs = millis();
-        return;
+    //   fresh           → real N2k depth, solid display
+    //   acquired stale  → 0xFFFF sentinel: MMDC blinks "400" (lost bottom indicator)
+    //   boot no data    → 0.0 ft fallback, or suppress to let MMDC blank
+    uint16_t d;
+    if (fresh) {
+        d = localDepthTenths;
+    } else if (bootNoData) {
+        if (!tune.bootFallback) {
+            statRS485Req++;
+            lastRS485TxMs = millis();
+            return;
+        }
+        d = 0; // 0.0 ft fallback at boot
+    } else {
+        // acquired stale: send 0xFFFF — MMDC recognises this as "no valid depth"
+        // and blinks its maximum range value (400 ft = lost bottom indicator).
+        // Confirmed 2026-07-20 by experiment.
+        d = 0xFFFF;
     }
 
-    // byte[11] controls display mode.
-    // Hypothesis: 0x02 = solid, 0x00 = blink (invalid depth indicator)
-    // tuneable per state to test without reflashing.
-    uint8_t b11 = fresh ? tune.freshByte11 : tune.staleByte11;
+    uint8_t b11 = tune.freshByte11; // 0x02 = solid; depth value controls blink, not this byte
 
     if (!fresh) statRS485StaleResp++;
 
